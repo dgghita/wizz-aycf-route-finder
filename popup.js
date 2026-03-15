@@ -212,9 +212,10 @@ async function checkAllRoutes() {
   const dateSelect = document.getElementById("date-select");
   const origin = originInput.value.toUpperCase();
   const selectedDate = dateSelect.value;
+  const searchType = document.querySelector('input[name="searchType"]:checked').value;
 
   if (!origin) {
-    alert("Please enter a departure airport code.");
+    alert("Please enter an airport code.");
     return;
   }
 
@@ -223,7 +224,7 @@ async function checkAllRoutes() {
   document.querySelector("#rate-limited-message").style.display = "none";
   routeListElement.innerHTML = "";
 
-  const cacheKey = `${origin}-${selectedDate}`;
+  const cacheKey = `${searchType}-${origin}-${selectedDate}`;
   const cachedResults = getCachedResults(cacheKey);
 
   if (cachedResults) {
@@ -280,15 +281,18 @@ async function checkAllRoutes() {
         await new Promise((resolve) => setTimeout(resolve, 15000));
       }
 
+      const apiOrigin = searchType === "arrive" ? destination : origin;
+      const apiDestination = searchType === "arrive" ? origin : destination;
+
       const updateProgress = () => {
-        progressElement.textContent = `Checking ${origin} to ${destination}... ${completedRoutes}/${destinations.length}`;
+        progressElement.textContent = `Checking ${apiOrigin} to ${apiDestination}... ${completedRoutes}/${destinations.length}`;
       };
       try {
-        const flights = await checkRoute(origin, destination, selectedDate);
+        const flights = await checkRoute(apiOrigin, apiDestination, selectedDate);
         if (flights && flights.length > 0) {
           flights.forEach((flight) => {
             const flightInfo = {
-              route: `${origin} (${flight.departureStationText}) to ${destination} (${flight.arrivalStationText}) - ${flight.flightCode}`,
+              route: `${apiOrigin} (${flight.departureStationText}) to ${apiDestination} (${flight.arrivalStationText}) - ${flight.flightCode}`,
               date: flight.departureDate,
               departure: `${flight.departure} (${flight.departureOffsetText})`,
               arrival: `${flight.arrival} (${flight.arrivalOffsetText})`,
@@ -473,10 +477,11 @@ function displayResults(flightsByDate, append = false) {
         const origin = document
           .getElementById("airport-input")
           .value.toUpperCase();
+        const searchType = document.querySelector('input[name="searchType"]:checked').value;
         const returnCacheKey = `${origin}-${date}-return-${flight.route}`;
         const cachedReturnData = localStorage.getItem(returnCacheKey);
 
-        if (!cachedReturnData) {
+        if (searchType !== "arrive" && !cachedReturnData) {
           const findReturnButton = document.createElement("button");
           findReturnButton.textContent = "Find Return";
           findReturnButton.style.width = "100px";
@@ -495,7 +500,7 @@ function displayResults(flightsByDate, append = false) {
             findReturnButton.remove();
           });
           flightItem.appendChild(findReturnButton);
-        } else if (cachedReturnData) {
+        } else if (searchType !== "arrive" && cachedReturnData) {
           const { results: returnFlights } = JSON.parse(cachedReturnData);
           flight.element = flightItem;
           displayReturnFlights(flight, returnFlights);

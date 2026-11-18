@@ -50,12 +50,20 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
 2–4 come first so the behaviors in 1/3/5 are debuggable.
 
 #### 0. UI structure (v2 rework)
-- **Session header** at the top: colored status dot + text on the left
-  ("Session valid" / "Session expired" / "Rate limited" / ...), action buttons
-  on the right. The probe button is "Refresh status" (in the extension it
-  flips to "Reload page to check session" when the content script is missing);
-  the app additionally gets "Re-login", which opens the Wizz webview and
-  auto-closes when the fresh session is captured.
+- **Session header** at the top. The **status chip itself is the refresh
+  button**: colored status dot + text ("Session valid" / "Session expired" /
+  "Rate limited" / ...) inside a small button; tapping it probes the session
+  again (in the extension it flips into "reload the multipass page and
+  re-probe" mode when the content script is missing). On the right:
+  **"Wizz AYCF Page"** — in the extension it switches to the multipass tab or
+  opens one if none exists; in the app it shows the capture webview (which
+  always has its X, plus back-button close). The app additionally gets
+  **"Re-login"**, which discards captured data and reloads the webview for a
+  fresh login, auto-closing when the new token is captured.
+  In the **extension both run automatically on popup open**: the session
+  probe (any multipass tab, not just the active one) and a fresh routes
+  scrape into the cache, which also re-renders the airport suggestions. The
+  app does not auto-probe (the countdown + probe-on-Start cover it).
 - The Wizz webview is fullscreen, so it gets a **fixed X Close button** at the
   top (back button also still closes it).
 - **Tab buttons** (two buttons stuck together, one active/pressed) for both
@@ -181,12 +189,19 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
   `{hasToken, expiresAtEpochSeconds, capturedAtEpochSeconds}` to the JS via a
   `getTokenInfo()` bridge.
 - The session header composes a real countdown into the status text:
-  "Session valid · token expires in Xm YYs", refreshed every 15 s.
+  "Session valid (MM:SS)" counting down, refreshed every 15 s.
   Amber when under 2 minutes remain, red past expiry. When the countdown hits
   zero, the text suggests a re-login.
 - Extension unaffected (no `getTokenInfo` bridge there).
+- **Optimistic auto-refresh on Start**: if the token is expired or under a
+  minute from expiry, Start reloads the capture webview before probing —
+  the multipass cookie is assumed to outlive the JWT, so re-auth is silent
+  and the batch proceeds (polls up to 60s for a fresh capture). If the
+  refresh produces nothing, the batch is refused with a "use Re-login"
+  message. Manual Re-login stays as the fallback.
 - **Done when:** after a re-login the header shows the countdown ticking down
-  and flips amber near expiry, without any probe call.
+  and flips amber near expiry, and a batch started against an expired token
+  recovers on its own (webview blip, fresh capture, batch runs).
 
 #### 8. UI polish round (extension + app)
 - **Inverted progress bar:** dark gray track, white overlaid text (no glow
@@ -239,8 +254,15 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
   IATA code dimmed right**; matches work on both name and code and convert
   internally to the code — picking always fills the code, and anything left
   in the field on blur is resolved to a code when the match is unique.
-  Before the first successful routes fetch the list is simply empty and
-  typing works exactly as before.
+  **App only — the input is gated on a fresh capture**: the routes JSON is
+  memory-only (never persisted), so until `hasWizzData()` is true the input
+  is disabled with placeholder "Loading airport data..."; once the Wizz page
+  capture lands (`__onWizzDataReady`, chained with the login-wait hook) the
+  input enables and the suggestions render from that fresh data. The
+  extension runs the same gate: it polls the cache, actively scrapes the
+  multipass tab while waiting, gives up after 10 s (input re-enables for
+  free typing). The loading placeholder is "Loading airport data...", the
+  ready/fallback one "Type an airport name...".
 - **Dropdown opens in-flow, select-style**: a chevron on the input's right
   edge toggles the list on demand (empty query = full airport network); while
   typing it filters. The box does not float — it opens **inside the layout
@@ -292,7 +314,16 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
   every Android build so it can install over the previous one.
 - Scheme for this phase: `1.9.9` with the `versionCode` as the build number
   (1.9.9 = build 2, next Android build = build 3, ...). `2.0.0` is reserved
-  for when v2 is operational on-device.
+  for when v2 is operational on-device. **Update 2025-11-19: v2 was declared
+  operational on-device, so `versionName` is now `2.0.0`** (build 7 was the
+  first 2.0.0 build); the Android `versionCode` keeps incrementing.
+- **App icon (build 7)**: master asset `shared/app-icon.jpeg` (white plane
+  shape with heart on Wizz pink). `android-app/scripts/make-icons.py`
+  regenerates the launcher set from it: legacy `mipmap-*/ic_launcher.png`
+  (full square) plus an adaptive icon — solid-pink background
+  (`#FB3D95`, sampled from the master) and a white-shape-on-transparent
+  foreground (`drawable/ic_launcher_foreground.png`), so launcher masking
+  never crops the shape. Running it again only needs `python3` + Pillow.
 - Android builds are requested explicitly; extension testing needs no build.
 
 ## Build & install (current, CLI-only)

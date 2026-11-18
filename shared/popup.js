@@ -68,7 +68,7 @@ function refreshAirportSuggestions() {
   } catch (e) {
     console.error("Failed to load data for airport suggestions:", e);
   }
-  if (!Array.isArray(routes)) return;
+  if (!Array.isArray(routes)) return false;
 
   const stations = new Map();
   const record = (station) => {
@@ -86,6 +86,43 @@ function refreshAirportSuggestions() {
     .map(([code, label]) => ({ code, label }))
     .sort((a, b) => a.code.localeCompare(b.code));
   console.log(`Airport suggestions: ${airportStations.length} stations`);
+  return true;
+}
+
+/**
+ * Extension only, fire-and-forget: ask any multipass tab to scrape the routes
+ * data off the page into the popup cache. The routes gate polls this cache;
+ * this just feeds it while the user has a multipass page open.
+ */
+function scrapeRoutesFromMultipassTab() {
+  if (typeof chrome === "undefined" || !chrome.tabs || !chrome.tabs.query) {
+    return;
+  }
+  chrome.tabs.query({}, function (tabs) {
+    const tab = (tabs || []).find(
+      (t) => t.url && t.url.includes("multipass.wizzair.com")
+    );
+    if (!tab) return;
+    chrome.tabs.sendMessage(
+      tab.id,
+      { action: "getDestinations", origin: "" },
+      function (response) {
+        if (chrome.runtime.lastError || !response || !response.routes) return;
+        try {
+          const pageData = JSON.parse(
+            localStorage.getItem("wizz_page_data") || "{}"
+          );
+          pageData.routes = response.routes;
+          pageData.timestamp = Date.now();
+          localStorage.setItem("wizz_page_data", JSON.stringify(pageData));
+          console.log("Scraped fresh routes data from the multipass tab");
+          refreshAirportSuggestions();
+        } catch (e) {
+          console.error("Failed to cache scraped routes:", e);
+        }
+      }
+    );
+  });
 }
 
 function hideAirportDropdown() {
@@ -226,6 +263,11 @@ function setupAirportDropdown() {
   input.insertAdjacentElement("afterend", chevron);
 
   input.addEventListener("input", () => {
+    openAirportDropdown(input.value.trim().toUpperCase());
+  });
+  // Tapping/focusing the field opens the list (full network when empty) —
+  // standard autocomplete behavior, and touch-friendly on the phone
+  input.addEventListener("focus", () => {
     openAirportDropdown(input.value.trim().toUpperCase());
   });
   // Leaving the field with an airport name in it: convert to the code
@@ -851,7 +893,48 @@ function formatRemaining(ms) {
   const total = Math.max(0, Math.floor(ms / 1000));
   const minutes = Math.floor(total / 60);
   const seconds = total % 60;
-  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function getTokenInfoSafe() {
+  try {
+    return JSON.parse(Android.getTokenInfo());
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * App only, optimistic auto-refresh: the multipass cookie is assumed to
+ * outlive the JWT, so reloading the capture webview re-authenticates silently
+ * and mints a fresh token. Called when Start sees the token dead or nearly
+ * dead; polls until a healthy token is captured (or gives up like before).
+ */
+async function ensureFreshToken() {
+  const info = getTokenInfoSafe();
+  if (!info || !info.hasToken) return true; // never logged in: probe will decide
+  const remaining = info.expiresAtEpochSeconds * 1000 - Date.now();
+  if (remaining >= 60000) return true;
+
+  console.log(
+    `Token ${remaining > 0 ? `expires in ${formatRemaining(remaining)}` : "already expired"}: refreshing the capture webview`
+  );
+  Android.forceReLogin();
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline && !batchAborted) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const fresh = getTokenInfoSafe();
+    if (
+      fresh &&
+      fresh.hasToken &&
+      fresh.expiresAtEpochSeconds * 1000 - Date.now() > 60000
+    ) {
+      console.log("Fresh token captured");
+      return true;
+    }
+  }
+  console.warn("Token refresh did not produce a fresh token in 60s");
+  return false;
 }
 
 /**
@@ -872,6 +955,7 @@ function updateTokenCountdown() {
   }
   if (!info || !info.hasToken) return;
 
+
   const remaining = info.expiresAtEpochSeconds * 1000 - Date.now();
   if (remaining <= 0) {
     if (currentSessionState === "valid") {
@@ -884,7 +968,7 @@ function updateTokenCountdown() {
 
   const minutesLeft = remaining / 60000;
   const color = minutesLeft < 2 ? "#f5a623" : "#48c774";
-  text.textContent = `Session valid · token expires in ${formatRemaining(remaining)}`;
+  text.textContent = `Session valid (${formatRemaining(remaining)})`;
   dot.style.backgroundColor = color;
 }
 
@@ -895,12 +979,16 @@ function classifySessionStatus(status) {
   return "valid";
 }
 
-// Toggle the session button between a plain check and a page-reload retry
+// The session status button doubles as the refresh control. In reload mode
+// (extension: content script missing) clicking it reloads the Wizz page first.
 function updateSessionButton(reloadMode) {
   const button = document.getElementById("check-session");
   if (!button) return;
-  button.textContent = reloadMode ? "Reload page to check session" : "Refresh status";
   button.dataset.mode = reloadMode ? "reload" : "check";
+  if (reloadMode) {
+    const text = document.getElementById("session-text");
+    if (text) text.textContent = "Session check failed — tap to reload";
+  }
 }
 
 // Reload the multipass tab, then re-run the session check once it settles
@@ -929,6 +1017,15 @@ async function checkSessionStatus() {
     if (typeof Android !== "undefined") {
       const response = JSON.parse(Android.checkSession());
       const state = classifySessionStatus(response.status);
+      // A 500 carrying error.token.mismatch means the captured JWT no longer
+      // pairs with the cookie session — same practical consequence as expiry,
+      // so don't let the lenient "any non-401 is valid" rule pass it
+      if (String(response.body || "").includes("error.token.mismatch")) {
+        console.log("Session check: token.mismatch in body, treating as expired");
+        updateSessionChip("expired");
+        Android.forceReLogin();
+        return "expired";
+      }
       console.log(`Session check: status=${response.status} state=${state}`);
       updateSessionChip(state);
       if (state === "expired") {
@@ -937,9 +1034,14 @@ async function checkSessionStatus() {
       return state;
     }
 
-    // Chrome extension: probe from the multipass page via the content script
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab || !tab.url || !tab.url.includes("multipass.wizzair.com")) {
+    // Chrome extension: probe from the multipass page via the content script.
+    // Any multipass tab will do (the sidebar can be open on any page), not
+    // just the currently active one.
+    const allTabs = await chrome.tabs.query({});
+    const tab = (allTabs || []).find(
+      (t) => t.url && t.url.includes("multipass.wizzair.com")
+    );
+    if (!tab) {
       updateSessionChip("error");
       throw new Error("Open the Wizz Air Multipass page to check the session");
     }
@@ -1106,6 +1208,31 @@ async function checkRoute(origin, destination, date) {
       "Content-Type": "application/json",
     };
 
+/**
+ * The multipass availability API answers in a couple of envelope shapes
+ * (the in-page extension variant answers flat; the native replay sometimes
+ * receives the same payload wrapped in a "content" envelope). Returns:
+ *   - an array of flights when the shape is understood,
+ *   - { closed: true } when Wizz explicitly says "nothing on this route/date"
+ *     (error.availability, flat or nested),
+ *   - { unknown: snippet } when no known shape matched, so the caller can
+ *     surface the raw body instead of quietly reporting zero flights.
+ */
+function extractAvailabilityFlights(parsed) {
+  const snippet = () => JSON.stringify(parsed).slice(0, 140);
+  if (!parsed || typeof parsed !== "object") return { unknown: snippet() };
+  if (parsed.code === "error.availability") return { closed: true };
+  if (Array.isArray(parsed.flightsOutbound)) return parsed.flightsOutbound;
+  const inner = parsed.content;
+  if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+    if (inner.code === "error.availability") return { closed: true };
+    if (Array.isArray(inner.flightsOutbound)) return inner.flightsOutbound;
+    if (Array.isArray(inner.content)) return inner.content;
+  }
+  if (Array.isArray(parsed.content)) return parsed.content;
+  return { unknown: snippet() };
+}
+
     if (typeof Android !== "undefined") {
       // Route the API call through the native bridge to avoid CORS issues
       const callStart = Date.now();
@@ -1145,15 +1272,13 @@ async function checkRoute(origin, destination, date) {
         }
         throw parseError;
       }
-      // 400 error.availability = Wizz-speak for "nothing on this route/date"
-      if (responseData && responseData.code === "error.availability") {
-        return [];
-      }
+      const extracted = extractAvailabilityFlights(responseData);
+      if (extracted.closed) return []; // nothing on this route/date
+      if (Array.isArray(extracted)) return extracted;
       if (response.status >= 400) {
         throw makeHttpError(response.status, bodyText);
       }
-
-      return responseData.flightsOutbound || [];
+      throw new Error(`Unexpected response shape: ${extracted.unknown}`);
     }
 
     // Chrome extension: repeat request headers captured by the content script
@@ -1228,14 +1353,13 @@ async function checkRoute(origin, destination, date) {
       }
       throw parseError;
     }
-    // 400 error.availability = Wizz-speak for "nothing on this route/date"
-    if (responseData && responseData.code === "error.availability") {
-      return [];
-    }
+    const extracted = extractAvailabilityFlights(responseData);
+    if (extracted.closed) return []; // nothing on this route/date
+    if (Array.isArray(extracted)) return extracted;
     if (!fetchResponse.ok) {
       throw makeHttpError(fetchResponse.status, responseText);
     }
-    return responseData.flightsOutbound || [];
+    throw new Error(`Unexpected response shape: ${extracted.unknown}`);
   } catch (error) {
     console.error("Error in checkRoute:", error);
     throw error;
@@ -1251,15 +1375,16 @@ async function checkAllRoutes() {
   const selectedDate = getSelectedDate();
   const searchType = getSearchType();
 
-  if (!origin) {
-    alert("Please enter an airport code.");
-    return;
-  }
-
-  // The same button starts and stops: while a batch runs, clicking it aborts
+  // The same button starts and stops: while a batch runs, clicking it aborts.
+  // Stop takes precedence over validation — aborting must never be refused.
   if (batchRunning) {
     console.log("Stop pressed: aborting the batch");
     batchAborted = true;
+    return;
+  }
+
+  if (!origin) {
+    alert("Please enter an airport code.");
     return;
   }
 
@@ -1277,6 +1402,18 @@ async function checkAllRoutes() {
       throw new Error(".route-list element not found in the DOM");
     }
 
+    // Optimistic auto-refresh: a dead or nearly-dead token recovers by itself
+    // (silent cookie re-auth in the capture webview) instead of failing the
+    // batch. No token info at all = never logged in; let the probe decide.
+    if (typeof Android !== "undefined") {
+      updateBatchBar("Checking session token...", 0);
+      const refreshed = await ensureFreshToken();
+      if (!refreshed) {
+        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Token expired and could not be refreshed automatically. Use Re-login and try again.</p>`;
+        return;
+      }
+    }
+
     // Probe session/token health first: only a definite "valid" starts a batch
     const sessionState = await checkSessionStatus();
     if (sessionState !== "valid") {
@@ -1286,7 +1423,7 @@ async function checkAllRoutes() {
       } else if (sessionState === "ratelimited") {
         document.querySelector("#rate-limited-message").style.display = "block";
       } else {
-        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Could not verify the session. Use Check session (in the browser: reload the multipass page) and try again.</p>`;
+        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Could not verify the session. Tap the session status at the top and try again.</p>`;
         if (typeof Android !== "undefined") {
           Android.openWizzLogin();
         }
@@ -1388,6 +1525,15 @@ async function checkAllRoutes() {
             `Error processing ${apiOrigin} to ${apiDestination} on ${selectedDate}:`,
             error.message
           );
+
+          // Session-level breakage: the captured JWT no longer pairs with the
+          // server's expected session. Retrying routes is pointless — stop.
+          if (String(error.message || "").includes("error.token.mismatch")) {
+            console.error("Token mismatch — stopping batch");
+            if (typeof Android !== "undefined") Android.forceReLogin();
+            routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Wizz rejected the captured token (token.mismatch). Use Re-login and try again.</p>`;
+            return;
+          }
 
           if (error.isRateLimit) {
             backoffsForRoute++;
@@ -1608,10 +1754,14 @@ function displayResults(flightsByDate, append = false, outcomes = null) {
       detailsDiv.style.justifyContent = "space-between";
 
       const departureDiv = document.createElement("div");
-      departureDiv.textContent = `✈️ Departure: ${flight.departure}`;
+      departureDiv.appendChild(document.createTextNode("✈️ Departure:"));
+      departureDiv.appendChild(document.createElement("br"));
+      departureDiv.appendChild(document.createTextNode(flight.departure));
 
       const arrivalDiv = document.createElement("div");
-      arrivalDiv.textContent = `🛬 Arrival: ${flight.arrival}`;
+      arrivalDiv.appendChild(document.createTextNode("🛬 Arrival:"));
+      arrivalDiv.appendChild(document.createElement("br"));
+      arrivalDiv.appendChild(document.createTextNode(flight.arrival));
 
       const durationDiv = document.createElement("div");
       durationDiv.textContent = `⏱️ Duration: ${flight.duration}`;
@@ -1723,7 +1873,8 @@ document.addEventListener("DOMContentLoaded", () => {
       });
     });
 
-  // Session header: dot + status text left, actions right
+  // Session header: the status chip itself is the refresh control (dot + text
+  // in a button); actions sit on the right
   const sessionHeader = document.createElement("div");
   sessionHeader.id = "session-header";
   sessionHeader.classList.add("mb-4");
@@ -1731,10 +1882,13 @@ document.addEventListener("DOMContentLoaded", () => {
   sessionHeader.style.alignItems = "center";
   sessionHeader.style.justifyContent = "space-between";
 
-  const statusWrap = document.createElement("div");
-  statusWrap.style.display = "flex";
-  statusWrap.style.alignItems = "center";
-  statusWrap.style.gap = "8px";
+  const statusButton = document.createElement("button");
+  statusButton.id = "check-session";
+  statusButton.classList.add("button", "is-small", "is-light");
+  statusButton.style.display = "flex";
+  statusButton.style.alignItems = "center";
+  statusButton.style.gap = "8px";
+  statusButton.title = "Refresh session status";
 
   const sessionDot = document.createElement("span");
   sessionDot.id = "session-dot";
@@ -1744,40 +1898,64 @@ document.addEventListener("DOMContentLoaded", () => {
   sessionDot.style.backgroundColor = "#b5b5b5";
   sessionDot.style.flexShrink = "0";
   sessionDot.style.display = "inline-block";
-  statusWrap.appendChild(sessionDot);
 
   const sessionText = document.createElement("span");
   sessionText.id = "session-text";
   sessionText.textContent = "Session unknown";
   sessionText.style.fontSize = "0.85em";
-  statusWrap.appendChild(sessionText);
-  sessionHeader.appendChild(statusWrap);
+
+  statusButton.appendChild(sessionDot);
+  statusButton.appendChild(sessionText);
+  statusButton.addEventListener("click", () => {
+    if (typeof Android === "undefined" && statusButton.dataset.mode === "reload") {
+      reloadPageAndCheckSession();
+    } else {
+      statusButton.dataset.mode = "check";
+      checkSessionStatus();
+    }
+  });
+  sessionHeader.appendChild(statusButton);
 
   const actionWrap = document.createElement("div");
   actionWrap.style.display = "flex";
   actionWrap.style.gap = "8px";
 
-  const sessionButton = document.createElement("button");
-  sessionButton.id = "check-session";
-  sessionButton.textContent = "Refresh status";
-  sessionButton.classList.add("button", "is-small", "is-light");
-  sessionButton.addEventListener("click", () => {
-    if (typeof Android === "undefined" && sessionButton.dataset.mode === "reload") {
-      reloadPageAndCheckSession();
-    } else {
-      sessionButton.dataset.mode = "check";
-      checkSessionStatus();
+  // Open/switch to the Wizz Air Multipass page: keeps the session's source
+  // page around (staying active there keeps the token warm). In the app it
+  // shows the capture webview; it closes with its X or the back button.
+  const pageButton = document.createElement("button");
+  pageButton.id = "wizz-page";
+  pageButton.textContent = "Wizz AYCF Page";
+  pageButton.classList.add("button", "is-small", "is-info", "is-light");
+  pageButton.addEventListener("click", () => {
+    if (typeof Android !== "undefined") {
+      console.log("Opening Wizz session webview");
+      Android.openWizzPage();
+      return;
     }
+    chrome.tabs.query({}, (tabs) => {
+      const existing = tabs.find(
+        (t) => t.url && t.url.includes("multipass.wizzair.com")
+      );
+      if (existing) {
+        chrome.tabs.update(existing.id, { active: true });
+      } else {
+        chrome.tabs.create({
+          url: "https://multipass.wizzair.com/w6/subscriptions/spa/private-page/wallets",
+          active: true,
+        });
+      }
+    });
   });
-  actionWrap.appendChild(sessionButton);
+  actionWrap.appendChild(pageButton);
 
   if (typeof Android !== "undefined") {
-    // App-only: open the Wizz webview to refresh the session; it auto-closes
-    // when the fresh token is captured
+    // App-only: discard the captured data and reload the webview for a
+    // completely fresh login; auto-closes when the fresh token is captured
     const reloginButton = document.createElement("button");
     reloginButton.id = "open-wizz-session";
     reloginButton.textContent = "Re-login";
-    reloginButton.classList.add("button", "is-small", "is-info", "is-light");
+    reloginButton.classList.add("button", "is-small", "is-danger", "is-light");
     reloginButton.addEventListener("click", () => {
       console.log("Re-login requested: opening Wizz session webview");
       Android.forceReLogin();
@@ -1803,10 +1981,65 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // App only: live token expiry countdown in the session header
+  // Live token expiry countdown in the session header (app only)
   if (typeof Android !== "undefined") {
     updateTokenCountdown();
     setInterval(updateTokenCountdown, 15000);
+  }
+
+  // The dropdown's data is whatever routes JSON was captured/scraped, never
+  // stale. Gate the airport input on that data instead of letting anyone
+  // type into an empty-suggestions field.
+  const airportGate = () => {
+    if (Android.hasWizzData()) {
+      airportInput.disabled = false;
+      airportInput.placeholder = "Type an airport name...";
+      return;
+    }
+    airportInput.disabled = true;
+    airportInput.placeholder = "Loading airport data...";
+    setTimeout(airportGate, 1000);
+  };
+  if (typeof Android !== "undefined") {
+    // App: the capture lands when the login webview delivers its data
+    const previousReadyHook = window.__onWizzDataReady;
+    window.__onWizzDataReady = () => {
+      if (typeof previousReadyHook === "function") previousReadyHook();
+      refreshAirportSuggestions();
+    };
+    airportGate();
+  } else {
+    // Extension: poll the cache; while nothing is cached, actively scrape
+    // the multipass tab. Give up after 10s — enable typing and let Check
+    // Routes handle data collection (it opens the multipass page itself).
+    let polls = 0;
+    let lastScrapePoll = -5;
+    const extensionGate = () => {
+      polls += 1;
+      if (refreshAirportSuggestions()) {
+        airportInput.disabled = false;
+        airportInput.placeholder = "Type an airport name...";
+        return;
+      }
+      if (polls > 10) {
+        airportInput.disabled = false;
+        airportInput.placeholder = "Type an airport name...";
+        return;
+      }
+      airportInput.disabled = true;
+      airportInput.placeholder = "Loading airport data...";
+      if (polls - lastScrapePoll >= 5) {
+        lastScrapePoll = polls;
+        scrapeRoutesFromMultipassTab();
+      }
+      setTimeout(extensionGate, 1000);
+    };
+    extensionGate();
+
+    // Auto-run the session check the moment the popup opens, and grab a
+    // fresh routes scrape while the multipass tab is being poked anyway
+    checkSessionStatus().catch((e) => console.warn("Auto session check:", e));
+    scrapeRoutesFromMultipassTab();
   }
 
   refreshAirportSuggestions();
@@ -1831,7 +2064,14 @@ document.addEventListener("DOMContentLoaded", function () {
     const button = document.createElement("button");
     button.type = "button";
     button.classList.add("button");
-    button.dataset.date = date.toISOString().split("T")[0];
+    // Local date, not toISOString: at 00:30 in Bucharest the UTC ISO date is
+    // still yesterday, and the chip would say Nov 19 while searching Nov 18
+    button.dataset.date =
+      date.getFullYear() +
+      "-" +
+      String(date.getMonth() + 1).padStart(2, "0") +
+      "-" +
+      String(date.getDate()).padStart(2, "0");
 
     const monthDay = document.createElement("span");
     monthDay.textContent = date.toLocaleDateString("en-US", {

@@ -10,6 +10,7 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -251,6 +252,12 @@ class MainActivity : Activity() {
             }
         }
 
+        /** Unconditionally show the Wizz page, keeping any captured data. */
+        @JavascriptInterface
+        fun openWizzPage() {
+            showWizzLogin(false)
+        }
+
         /** Force the login page to show, discarding any captured data. */
         @JavascriptInterface
         fun forceReLogin() {
@@ -323,6 +330,15 @@ class MainActivity : Activity() {
 
                 val headers = synchronized(authLock) { HashMap(authHeaders) }
                 headers["Content-Type"] = "application/json"
+                // shouldInterceptRequest never exposes the WebView's cookies,
+                // so replay them explicitly: Wizz binds the JWT to the cookie
+                // session, and without them it answers 500 error.token.mismatch
+                runCatching {
+                    val cookies = CookieManager.getInstance().getCookie(url)
+                    if (!cookies.isNullOrEmpty() && headers.keys.none { it.equals("Cookie", ignoreCase = true) }) {
+                        headers["Cookie"] = cookies
+                    }
+                }
                 for ((name, value) in headers) {
                     if (name.lowercase() !in SKIP_SEND_HEADERS) {
                         runCatching { connection.setRequestProperty(name, value) }

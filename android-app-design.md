@@ -331,9 +331,14 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
 ```bash
 export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
 export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
-cd android-app && ./gradlew assembleDebug
-# → app/build/outputs/apk/debug/app-debug.apk
+cd android-app && ./gradlew assembleRelease
+# → app/build/outputs/apk/release/WizzRouteFinder-v<version>-build<N>-release.apk
 ```
+
+- Release is signed with the debug key (`signingConfig = signingConfigs.getByName("debug")`),
+  so it installs over the debug builds. Outputs are named with the version
+  (`WizzRouteFinder-v2.0.0-build7-release.apk`). Verify signatures with
+  `apksigner verify --print-certs <apk>` (jarsigner does not see v2-only schemes).
 
 - `-  adb` at `/opt/homebrew/share/android-commandlinetools/platform-tools/adb`
 - **Watch logs:** `adb logcat | grep -i wizz` (once v2 logging lands, filter tag TBD)

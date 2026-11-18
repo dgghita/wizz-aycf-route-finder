@@ -6,6 +6,40 @@
   <title>Wizz Air Route Preview</title>
   <link rel="stylesheet" href="css/bulma.min.css">
   <style>
+    html,
+    body {
+      height: 100%;
+    }
+    body {
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    /* The section scrolls; header (above) and footer (below) stay put */
+    section.section {
+      flex: 1 1 auto;
+      overflow-y: auto;
+      min-height: 0;
+      padding-top: 8px;
+      padding-bottom: 12px;
+    }
+    footer.app-footer {
+      flex: 0 0 auto;
+      padding: 6px 14px 8px;
+      font-size: 0.72rem;
+      color: #8a8a8a;
+      border-top: 1px solid #ececec;
+      background: #ffffff;
+      line-height: 1.4;
+    }
+    footer.app-footer p {
+      margin: 0 0 2px;
+    }
+    footer.app-footer a {
+      color: inherit;
+      text-decoration: underline;
+    }
     .container {
       width: 100%;
       max-width: none;
@@ -13,55 +47,222 @@
     #rate-limited-message {
       display: none;
     }
+    /* Sticky app-style header bar, above everything */
+    #session-header {
+      position: sticky;
+      top: 0;
+      left: 0;
+      right: 0;
+      width: 100%;
+      z-index: 100;
+      background: #ffffff;
+      border-bottom: 1px solid #e0e0e0;
+      padding: 10px 14px;
+      margin: 0 0 8px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+    }
+    /* Tab-button pairs stretch to full width */
+    #search-type-tabs,
+    #main-tabs,
+    #date-tabs {
+      width: 100%;
+      display: flex;
+      flex-wrap: nowrap;
+    }
+    #search-type-tabs > .button,
+    #main-tabs > .button,
+    #date-tabs > .button {
+      flex: 1 1 0;
+    }
+    /* Space under Start / Clear All matching the 12px gap above them, so the
+       results don't stick to the buttons */
+    #search-flights,
+    #history-clear-all {
+      margin-bottom: 12px;
+    }
+    /* Calendar-style date chips: bold "Nov 19" title, small weekday caption */
+    #date-tabs > .button {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      line-height: 1.25;
+      padding: 0.7em 0;
+    }
+    #date-tabs .date-chip-title {
+      font-size: 0.95em;
+      font-weight: bold;
+    }
+    #date-tabs .date-chip-caption {
+      font-size: 0.75em;
+      margin-top: 2px;
+    }
+    /* Custom airport suggestion dropdown. It opens IN-FLOW right below the
+       input (pushing content down instead of floating over it) with a fixed
+       height, plus a chevron on the input's right edge to open it on demand */
+    #airport-input {
+      width: 100%;
+      padding-right: 34px;
+    }
+    #airport-input.dropdown-open {
+      border-bottom-right-radius: 0;
+      border-bottom-left-radius: 0;
+    }
+    .airport-chevron {
+      position: absolute;
+      right: 6px;
+      /* centered on the input itself (Bulma input is 2.5em high), not on the
+         grown control once the in-flow list opens beneath it */
+      top: 20px;
+      transform: translateY(-50%);
+      width: 24px;
+      height: 24px;
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 2;
+    }
+    .airport-chevron::before {
+      content: "";
+      width: 0;
+      height: 0;
+      border-left: 5px solid transparent;
+      border-right: 5px solid transparent;
+      border-top: 6px solid #8a8a8a;
+      transition: transform 0.15s ease;
+    }
+    .airport-chevron.open::before {
+      transform: rotate(180deg);
+    }
+    .airport-dropdown {
+      display: none;
+      /* Fixed height, retro "split-open" panel: ~5 rows even when empty,
+         gray frame around the rows, hairline borders between them */
+      height: 172px;
+      box-sizing: border-box;
+      overflow-y: auto;
+      background: #eeeeee;
+      border: 1px solid #c8c8c8;
+      border-top: none;
+      border-radius: 0 0 4px 4px;
+      margin-top: -1px;
+      padding: 4px 5px;
+    }
+    .airport-dropdown .airport-option {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 7px 8px;
+      font-size: 0.85rem;
+      cursor: pointer;
+      border-bottom: 1px solid #dcdcdc;
+    }
+    .airport-dropdown .airport-option:last-child {
+      border-bottom: none;
+    }
+    .airport-dropdown .airport-option .code {
+      flex-shrink: 0;
+      color: #777777;
+    }
+    .airport-dropdown .airport-option .name {
+      text-align: left;
+      font-weight: bold;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .airport-dropdown .airport-option.active,
+    .airport-dropdown .airport-option:hover {
+      background: #ffffff;
+    }
+    /* Phone-style toggle switch: label left, switch right */
+    .detailed-log-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 2px;
+      margin: 12px 0 8px;
+    }
+    .detailed-log-row .switch-label {
+      font-size: 0.9rem;
+      color: #363636;
+    }
+    .detailed-log-row .wizz-switch {
+      position: relative;
+      display: inline-block;
+      width: 46px;
+      height: 26px;
+      flex-shrink: 0;
+    }
+    .detailed-log-row .wizz-switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .detailed-log-row .wizz-switch .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #dbdbdb;
+      border-radius: 26px;
+      transition: background-color 0.2s ease;
+    }
+    .detailed-log-row .wizz-switch .slider::before {
+      content: "";
+      position: absolute;
+      height: 20px;
+      width: 20px;
+      left: 3px;
+      top: 3px;
+      background-color: #ffffff;
+      border-radius: 50%;
+      transition: transform 0.2s ease;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+    }
+    .detailed-log-row .wizz-switch input:checked + .slider {
+      background-color: #485fc7;
+    }
+    .detailed-log-row .wizz-switch input:checked + .slider::before {
+      transform: translateX(20px);
+    }
+    /* Per-route status cards: always rendered, visibility is retroactive
+       via the container class flipped by the "Show detailed log" toggle */
+    .route-cards {
+      margin-bottom: 10px;
+    }
+    .route-cards:not(.show-details) .route-status-card {
+      display: none;
+    }
   </style>
 </head>
 <body>
   <section class="section">
     <div class="container">
-      <div class="title">
-        <h1 class="is-size-5">Wizz AYCF Route Finder</h1>
-        <p class="is-size-7 mt-2">
-          <a href="https://github.com/vloss3/wizz-aycf-route-finder" target="_blank">GitHub</a> |
-          <a href="https://github.com/vloss3" target="_blank">Author</a> |
-          <a href="https://chromewebstore.google.com/detail/aycf-route-finder/ppopfobaaakhcogialemngniimoplcnp" target="_blank">Chrome Web Store</a> |
-          <a href="https://discord.gg/k3eRaSBez4" target="_blank">Discord</a> | 
-          <a href="https://ko-fi.com/vloss3/?hidefeed=true&widget=true&embed=true&preview=true" target="_blank">☕️ Support the project</a>
-        </p>
-      </div>
       <div class="field">
-        <label class="label">Airport</label>
         <div class="control">
-          <label class="radio">
-            <input type="radio" name="searchType" value="depart" checked>
-            Depart from
-          </label>
-          <label class="radio">
-            <input type="radio" name="searchType" value="arrive">
-            Arrive to
-          </label>
+          <div class="buttons has-addons" id="search-type-tabs">
+            <button type="button" class="button is-link" data-search-type="depart">Depart from</button>
+            <button type="button" class="button is-light" data-search-type="arrive">Arrive to</button>
+          </div>
         </div>
       </div>
       <div class="field">
         <div class="control">
-          <input id="airport-input" class="input" type="text" placeholder="Enter airport code (e.g., LTN)">
+          <input id="airport-input" class="input" type="text" placeholder="Enter airport code (e.g., LTN)" autocomplete="off" spellcheck="false">
         </div>
       </div>
       <div class="field">
-        <label class="label">Departure Date</label>
         <div class="control">
-          <select id="date-select" class="select">
-          </select>
+          <div class="buttons has-addons" id="date-tabs"></div>
         </div>
       </div>
-      <div class="field mt-3">
-        <div class="control">
-          <label class="checkbox">
-            <input type="checkbox" id="play-audio-checkbox">
-            Waiting music 🎶
-          </label>
-        </div>
-      </div>
-      <button id="search-flights" class="button is-link mb-4">Check Routes</button>
+      <button id="search-flights" class="button is-primary is-fullwidth">Start</button>
       <div class="notification is-danger" id="rate-limited-message">
         <p class="has-text-weight-bold">Rate limited</p>
         <p class="mt-2">Search stopped due to rate limiting. Results shown are partial. Please wait a few minutes before searching again.</p>
@@ -72,10 +273,10 @@
         </div>
       </div>
     </div>
-    <p class="is-size-6 mt-3"><b>Disclaimer:</b> This extension is not affiliated with Wizz Air or its partners in any way. It is a personal project to help Multipass users like me find available routes.</p>
-    <p class="is-size-6 mt-3">Please use responsibly and at your own risk. Doing too many searches in a short period of time will result in temporary rate limiting.</p>
-    <p class="is-size-6 mt-3">Version 1.4.1 - <a href="https://github.com/vloss3/wizz-aycf-route-finder/releases" target="_blank">Changelog</a> </p>
   </section>
+  <footer class="app-footer">
+    <p>Version 1.9.9 (2.0 preview) - <a href="https://github.com/dgghita/wizz-aycf-route-finder/releases" target="_blank">Changelog</a></p>
+  </footer>
   <script src="popup.js"></script>
 </body>
 </html>

@@ -42,22 +42,259 @@ function waitForWizzData(timeoutMs = 300000) {
   });
 }
 
-async function fetchDestinations(origin) {
+/**
+ * Airport suggestions: harvest every station that appears in the Wizz routes
+ * data we already capture on each platform (no new request), then render a
+ * custom dropdown under the input (the native datalist popup is browser-styled
+ * and sits offset in narrow sidebars).
+ * Station objects carry the IATA code in `id` (that is what the whole
+ * pipeline matches on); a human label is used when present.
+ */
+let airportStations = [];
+
+function refreshAirportSuggestions() {
+  let routes = null;
+  try {
+    if (typeof Android !== "undefined") {
+      if (Android.hasWizzData()) {
+        routes = JSON.parse(Android.getRoutesJson());
+      }
+    } else {
+      const pageData = JSON.parse(
+        localStorage.getItem("wizz_page_data") || "{}"
+      );
+      routes = pageData.routes || null;
+    }
+  } catch (e) {
+    console.error("Failed to load data for airport suggestions:", e);
+  }
+  if (!Array.isArray(routes)) return;
+
+  const stations = new Map();
+  const record = (station) => {
+    if (!station || !station.id || stations.has(station.id)) return;
+    const label =
+      station.name || station.cityName || station.fullName || station.code || "";
+    stations.set(station.id, label);
+  };
+  routes.forEach((route) => {
+    record(route.departureStation);
+    (route.arrivalStations || []).forEach(record);
+  });
+
+  airportStations = [...stations.entries()]
+    .map(([code, label]) => ({ code, label }))
+    .sort((a, b) => a.code.localeCompare(b.code));
+  console.log(`Airport suggestions: ${airportStations.length} stations`);
+}
+
+function hideAirportDropdown() {
+  const dropdown = document.getElementById("airport-dropdown");
+  if (dropdown) dropdown.style.display = "none";
+  const input = document.getElementById("airport-input");
+  if (input) {
+    input.classList.remove("dropdown-open");
+    const chevron = document.getElementById("airport-chevron");
+    if (chevron) chevron.classList.remove("open");
+  }
+}
+
+function openAirportDropdown(query) {
+  const input = document.getElementById("airport-input");
+  if (!input || airportStations.length === 0) return;
+  let dropdown = document.getElementById("airport-dropdown");
+  if (!dropdown) {
+    const control = input.parentNode;
+    dropdown = document.createElement("div");
+    dropdown.id = "airport-dropdown";
+    dropdown.className = "airport-dropdown";
+    control.appendChild(dropdown);
+  }
+
+  // Empty query = opened on demand via the chevron: show the whole network.
+  // Zero matches renders an empty panel — the open/closed geometry never
+  // jumps around.
+  const matches = (
+    query
+      ? airportStations.filter(
+          (station) =>
+            station.code.includes(query) ||
+            station.label.toUpperCase().includes(query)
+        )
+      : airportStations
+  ).slice(0, 200);
+
+  dropdown.innerHTML = "";
+  let activeIndex = -1;
+  const setActive = (index) => {
+    activeIndex = index;
+    [...dropdown.querySelectorAll(".airport-option")].forEach((option, i) => {
+      option.classList.toggle("active", i === activeIndex);
+      if (i === activeIndex) option.scrollIntoView({ block: "nearest" });
+    });
+  };
+
+  matches.forEach((station) => {
+    const option = document.createElement("div");
+    option.className = "airport-option";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = station.label || station.code;
+    const code = document.createElement("span");
+    code.className = "code";
+    code.textContent = station.code;
+    option.appendChild(name);
+    option.appendChild(code);
+    option.addEventListener("mousedown", (event) => {
+      event.preventDefault(); // keep focus in the input
+      input.value = station.code;
+      hideAirportDropdown();
+    });
+    dropdown.appendChild(option);
+  });
+
+  // In-flow: pushes the content below down instead of floating over it
+  dropdown.style.display = "block";
+  input.classList.add("dropdown-open");
+  const chevron = document.getElementById("airport-chevron");
+  if (chevron) chevron.classList.add("open");
+
+  // Keyboard navigation lives on the input: focus never leaves it
+  input.onkeydown = (event) => {
+    if (dropdown.style.display !== "block") return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setActive(Math.min(matches.length - 1, activeIndex + 1));
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActive(Math.max(0, activeIndex - 1));
+    } else if (event.key === "Enter" && activeIndex >= 0) {
+      event.preventDefault();
+      input.value = matches[activeIndex].code;
+      hideAirportDropdown();
+    } else if (event.key === "Escape") {
+      hideAirportDropdown();
+    }
+  };
+}
+
+/**
+ * The whole pipeline speaks IATA codes, but the user may have typed an airport
+ * NAME and chosen it visually. Resolve what's in the input to a code: exact
+ * code passes through; a unique code-prefix or station-name match converts.
+ * Returns null when it cannot be resolved confidently (then the raw value
+ * flows on and Wizz decides).
+ */
+function resolveAirportInput(raw) {
+  const value = String(raw).trim().toUpperCase();
+  if (!value) return null;
+  const byCode = airportStations.filter(
+    (station) => station.code.toUpperCase() === value
+  );
+  if (byCode.length > 0) return value;
+  const byLabel = airportStations.filter(
+    (station) => station.label.toUpperCase().includes(value)
+  );
+  if (byLabel.length === 1) return byLabel[0].code;
+  return null;
+}
+
+function setupAirportDropdown() {
+  const input = document.getElementById("airport-input");
+  if (!input || input.dataset.dropdownReady) return;
+  input.dataset.dropdownReady = "true";
+
+  const control = input.parentNode;
+  control.style.position = "relative";
+
+  // Chevron on the input's right edge: opens/closes the list on demand
+  const chevron = document.createElement("button");
+  chevron.type = "button";
+  chevron.id = "airport-chevron";
+  chevron.className = "airport-chevron";
+  chevron.setAttribute("aria-label", "Show airport list");
+  chevron.addEventListener("mousedown", (event) => event.preventDefault());
+  chevron.addEventListener("click", () => {
+    const dropdown = document.getElementById("airport-dropdown");
+    const isOpen = dropdown && dropdown.style.display === "block";
+    if (isOpen) {
+      hideAirportDropdown();
+    } else {
+      openAirportDropdown(input.value.trim().toUpperCase());
+    }
+  });
+  input.insertAdjacentElement("afterend", chevron);
+
+  input.addEventListener("input", () => {
+    openAirportDropdown(input.value.trim().toUpperCase());
+  });
+  // Leaving the field with an airport name in it: convert to the code
+  input.addEventListener("blur", () => {
+    const value = input.value.trim();
+    if (!value) return;
+    const code = resolveAirportInput(value);
+    if (code) {
+      input.value = code;
+    }
+  });
+  // ArrowDown opens the list when closed (old-school select behavior)
+  input.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowDown") return;
+    const dropdown = document.getElementById("airport-dropdown");
+    if (!dropdown || dropdown.style.display !== "block") {
+      openAirportDropdown(input.value.trim().toUpperCase());
+    }
+  });
+  // Click anywhere outside closes it (blur-based hiding would fight the
+  // chevron button)
+  document.addEventListener("mousedown", (event) => {
+    if (!control.contains(event.target)) hideAirportDropdown();
+  });
+}
+
+/**
+ * Airports to check for the chosen mode: "depart" = airports served FROM
+ * origin; "arrive" = airports that fly INTO origin. Returns null when the
+ * routes data has no match, so callers can fall through to the next source.
+ */
+function extractDestinationIds(routes, origin, searchType) {
+  if (searchType === "arrive") {
+    const inbound = routes
+      .filter(
+        (route) =>
+          route.departureStation &&
+          route.departureStation.id !== origin &&
+          route.arrivalStations &&
+          route.arrivalStations.some((station) => station.id === origin)
+      )
+      .map((route) => route.departureStation.id);
+    if (inbound.length === 0) return null;
+    console.log(`Routes to ${origin}:`, inbound);
+    return inbound;
+  }
+  const routesFromOrigin = routes.find(
+    (route) => route.departureStation.id === origin
+  );
+  if (routesFromOrigin && routesFromOrigin.arrivalStations) {
+    const destinationIds = routesFromOrigin.arrivalStations.map(
+      (station) => station.id
+    );
+    console.log(`Routes from ${origin}:`, destinationIds);
+    return destinationIds;
+  }
+  return null;
+}
+
+async function fetchDestinations(origin, searchType) {
   if (typeof Android !== "undefined") {
     Android.openWizzLogin();
 
     const routes = await waitForWizzData();
-    const routesFromOrigin = routes.find(
-      (route) => route.departureStation.id === origin
-    );
-    if (routesFromOrigin && routesFromOrigin.arrivalStations) {
-      const destinationIds = routesFromOrigin.arrivalStations.map(
-        (station) => station.id
-      );
-      console.log(`Routes from ${origin}:`, destinationIds);
+    const destinationIds = extractDestinationIds(routes, origin, searchType);
+    if (destinationIds) {
       return destinationIds;
     }
-    throw new Error(`No routes found from ${origin}`);
+    throw new Error(`No ${searchType === "arrive" ? "routes to" : "routes from"} ${origin}`);
   }
 
   // Chrome extension: use cached page data or the content script
@@ -67,14 +304,12 @@ async function fetchDestinations(origin) {
     const oneHourInMs = 60 * 60 * 1000;
     if (Date.now() - data.timestamp < oneHourInMs && data.routes) {
       console.log("Using cached routes data");
-      const routesFromOrigin = data.routes.find(
-        (route) => route.departureStation.id === origin
+      const destinationIds = extractDestinationIds(
+        data.routes,
+        origin,
+        searchType
       );
-      if (routesFromOrigin && routesFromOrigin.arrivalStations) {
-        const destinationIds = routesFromOrigin.arrivalStations.map(
-          (station) => station.id
-        );
-        console.log(`Routes from ${origin}:`, destinationIds);
+      if (destinationIds) {
         return destinationIds;
       }
     }
@@ -95,17 +330,19 @@ async function fetchDestinations(origin) {
               };
               localStorage.setItem("wizz_page_data", JSON.stringify(pageData));
 
-              const routesFromOrigin = response.routes.find(
-                (route) => route.departureStation.id === origin
+              const destinationIds = extractDestinationIds(
+                response.routes,
+                origin,
+                searchType
               );
-              if (routesFromOrigin && routesFromOrigin.arrivalStations) {
-                const destinationIds = routesFromOrigin.arrivalStations.map(
-                  (station) => station.id
-                );
-                console.log(`Routes from ${origin}:`, destinationIds);
+              if (destinationIds) {
                 resolve(destinationIds);
               } else {
-                reject(new Error(`No routes found from ${origin}`));
+                reject(
+                  new Error(
+                    `No ${searchType === "arrive" ? "routes to" : "routes from"} ${origin}`
+                  )
+                );
               }
             } else if (response && response.error) {
               reject(new Error(response.error));
@@ -177,8 +414,564 @@ async function getDynamicUrl() {
   });
 }
 
+// Wizz answered with HTML instead of JSON: the search-endpoint URL's source
+// is stale. In the extension the content script reads that URL out of the
+// loaded page's DOM, so the only real refresh is reloading the Wizz tab; in
+// the app the hidden webview recaptures on its own after forceReLogin().
+function refreshDynamicSource() {
+  if (typeof Android !== "undefined") {
+    return new Promise((resolve) => {
+      // up to 45s for the webview to reload and recapture
+      let waited = 0;
+      const tick = () => {
+        if (Android.getDynamicUrl()) {
+          resolve(true);
+          return;
+        }
+        if (batchAborted || waited >= 45000) {
+          resolve(false);
+          return;
+        }
+        waited += 1000;
+        setTimeout(tick, 1000);
+      };
+      setTimeout(tick, 1000);
+    });
+  }
+
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs[0];
+      if (!tab || !tab.url || !tab.url.includes("multipass.wizzair.com")) {
+        resolve(false);
+        return;
+      }
+      chrome.tabs.reload(tab.id, {}, () => {
+        const listener = (tabId, info) => {
+          if (tabId === tab.id && info.status === "complete") {
+            chrome.tabs.onUpdated.removeListener(listener);
+            // The SPA needs a beat before its URL config is populated again
+            setTimeout(() => resolve(true), 2000);
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+      });
+    });
+  });
+}
+
 const HISTORY_KEY = "wizz_search_history";
 const HISTORY_LIMIT = 20;
+
+/** "depart" | "arrive", from the Depart/Arrive tab-buttons. */
+function getSearchType() {
+  const active = document.querySelector("#search-type-tabs .button.is-link");
+  return active ? active.getAttribute("data-search-type") : "depart";
+}
+
+// Batch control: stop flag plus the fixed progress bar shown while a batch runs
+let batchAborted = false;
+let batchRunning = false;
+
+/** The main button doubles as Stop: green "Start", red "Stop" while running. */
+function setMainButtonRunning(running) {
+  const button = document.getElementById("search-flights");
+  if (!button) return;
+  button.textContent = running ? "Stop" : "Start";
+  button.classList.toggle("is-primary", !running);
+  button.classList.toggle("is-danger", running);
+}
+
+// Backing off at Wizz's request (429)
+const DEFAULT_BACKOFF_SECONDS = 15;
+const MAX_BACKOFFS_PER_BATCH = 3;
+
+function getRetryAfterSeconds(headers) {
+  if (!headers) return null;
+  const value = headers["Retry-After"] || headers["retry-after"];
+  if (!value) return null;
+  const asNumber = Number(value);
+  if (!Number.isNaN(asNumber)) return Math.ceil(asNumber);
+  const asDate = Date.parse(value);
+  if (!Number.isNaN(asDate)) {
+    return Math.max(0, Math.ceil((asDate - Date.now()) / 1000));
+  }
+  return null;
+}
+
+function makeRateLimitError(backoffSeconds) {
+  const wait = backoffSeconds || DEFAULT_BACKOFF_SECONDS;
+  const error = new Error(
+    backoffSeconds
+      ? `Wizz asked us to back off for ${wait}s; retrying automatically`
+      : `Rate limited (429); backing off ${wait}s before retrying`
+  );
+  error.isRateLimit = true;
+  error.backoffSeconds = wait;
+  return error;
+}
+
+function makeHttpError(status, bodySnippet) {
+  const detail = bodySnippet ? String(bodySnippet).slice(0, 200) : "";
+  return new Error(`HTTP ${status}${detail ? `: ${detail}` : ""}`);
+}
+
+// Wizz answered an availability request with the SPA's HTML shell instead of
+// JSON: the captured search-endpoint URL is no longer an API endpoint. The
+// batch treats this as retryable after refreshing the URL's source page.
+function makeStaleUrlError(message) {
+  const error = new Error(message);
+  error.isStaleUrl = true;
+  return error;
+}
+
+// Same observability as the native bridge's logcat output, into the popup
+// console: one "[api]" line per request. Filter the DevTools console by
+// "api" to see only these.
+function logApiCall(label, status, latencyMs, bodySnippet, headers) {
+  const retryAfter = headers ? getRetryAfterSeconds(headers) : null;
+  const extras = retryAfter !== null ? ` Retry-After=${retryAfter}s` : "";
+  const body = bodySnippet ? ` body=${String(bodySnippet).slice(0, 200)}` : "";
+  console.log(`[api] ${label}: status=${status} in ${latencyMs}ms${extras}${body}`);
+}
+
+// End-of-batch notices, styled like a de-emphasized progress bar track:
+// light gray fill, small almost-black bold text centered in the bar
+function showBatchNotice(text, container) {
+  const notice = document.createElement("div");
+  notice.className = "batch-notice";
+  notice.style.width = "100%";
+  notice.style.margin = "0 0 8px";
+  notice.style.height = "26px";
+  notice.style.display = "flex";
+  notice.style.alignItems = "center";
+  notice.style.justifyContent = "center";
+  notice.style.backgroundColor = "#f0f0f0";
+  notice.style.borderRadius = "4px";
+  notice.style.fontSize = "0.85em";
+  notice.style.fontWeight = "bold";
+  notice.style.color = "#4a4a4a";
+  notice.textContent = text;
+  (container || document.querySelector(".route-list")).prepend(notice);
+}
+
+function abortableSleep(ms, onTick) {
+  return new Promise((resolve) => {
+    let remaining = ms;
+    const tick = () => {
+      if (batchAborted || remaining <= 0) {
+        resolve();
+        return;
+      }
+      remaining -= 250;
+      if (onTick) onTick(Math.max(0, remaining));
+      setTimeout(tick, 250);
+    };
+    tick();
+  });
+}
+
+function ensureBatchBar() {
+  let bar = document.getElementById("batch-bar");
+  if (bar) return bar;
+
+  // Sits directly under the dashboard summary row, in the page flow
+  ensureBatchSummary();
+  const summary = document.getElementById("batch-summary");
+
+  bar = document.createElement("div");
+  bar.id = "batch-bar";
+  bar.style.width = "100%";
+  bar.style.margin = "0 0 8px";
+  bar.style.display = "flex";
+  bar.style.alignItems = "center";
+
+  // Fat track with the status text overlaid, so the bar never changes size.
+  // Light track, light-ish blue fill, nearly-black text front and center.
+  const track = document.createElement("div");
+  track.style.position = "relative";
+  track.style.flex = "1";
+  track.style.height = "30px";
+  track.style.backgroundColor = "#f0f0f0";
+  track.style.borderRadius = "4px";
+  track.style.overflow = "hidden";
+
+  const fill = document.createElement("div");
+  fill.id = "batch-bar-fill";
+  fill.style.height = "100%";
+  fill.style.width = "0%";
+  fill.style.backgroundColor = "#4ecdc4";
+  fill.style.transition = "width 0.2s ease";
+  track.appendChild(fill);
+
+  const text = document.createElement("span");
+  text.id = "batch-bar-text";
+  text.style.position = "absolute";
+  text.style.top = "50%";
+  text.style.left = "50%";
+  text.style.transform = "translate(-50%, -50%)";
+  text.style.fontSize = "0.85em";
+  text.style.whiteSpace = "nowrap";
+  text.style.color = "#1c1c1c";
+  text.style.fontWeight = "bold";
+  track.appendChild(text);
+  bar.appendChild(track);
+
+  if (summary && summary.parentNode) {
+    summary.insertAdjacentElement("afterend", bar);
+  } else {
+    document.body.appendChild(bar);
+  }
+  return bar;
+}
+
+function updateBatchBar(text, fraction) {
+  const bar = document.getElementById("batch-bar");
+  if (!bar) return;
+  const fill = document.getElementById("batch-bar-fill");
+  const label = document.getElementById("batch-bar-text");
+  if (fill && fraction !== undefined) {
+    fill.style.width = `${Math.min(100, Math.max(0, fraction * 100))}%`;
+  }
+  if (label && text !== undefined) {
+    label.textContent = text;
+  }
+}
+
+function removeBatchBar() {
+  const bar = document.getElementById("batch-bar");
+  if (bar) bar.remove();
+}
+
+// Batch summary: dashboard-style Available / Closed / Errored counters, always
+// visible during and after a batch (independent of debug mode)
+let batchCounts = { found: 0, closed: 0, errored: 0 };
+
+function makeBatchSummaryColumn(id, label, color) {
+  const column = document.createElement("div");
+  column.style.textAlign = "center";
+  column.style.flex = "1";
+
+  const number = document.createElement("div");
+  number.id = `batch-summary-${id}`;
+  number.textContent = "0";
+  number.style.fontSize = "1.8em";
+  number.style.fontWeight = "bold";
+  number.style.color = color;
+  number.style.lineHeight = "1.1";
+  if (id === "errored") {
+    // Flips to a red chip with white text once the count is non-zero,
+    // so a climbing error tally is impossible to miss
+    number.style.padding = "0 10px";
+    number.style.borderRadius = "5px";
+  }
+  column.appendChild(number);
+
+  const labelText = document.createElement("div");
+  labelText.textContent = label;
+  labelText.style.fontSize = "0.8em";
+  labelText.style.color = "#4a4a4a";
+  column.appendChild(labelText);
+
+  return column;
+}
+
+function ensureBatchSummary() {
+  const existing = document.getElementById("batch-summary");
+  if (existing) return existing;
+
+  const row = document.createElement("div");
+  row.id = "batch-summary";
+  row.style.display = "none";
+  row.style.justifyContent = "space-around";
+  row.style.alignItems = "center";
+  row.style.width = "100%";
+  row.style.maxWidth = "600px";
+  row.style.margin = "10px auto";
+  row.style.padding = "10px";
+  row.style.border = "1px solid #ddd";
+  row.style.borderRadius = "5px";
+  row.style.backgroundColor = "#fafafa";
+
+  row.appendChild(makeBatchSummaryColumn("found", "Available", "#48c774"));
+  row.appendChild(makeBatchSummaryColumn("closed", "Closed", "#7a7a7a"));
+  row.appendChild(makeBatchSummaryColumn("errored", "Errored", "#ef5e74"));
+
+  const routeList = document.querySelector(".route-list");
+  if (routeList && routeList.parentNode) {
+    routeList.parentNode.insertBefore(row, routeList);
+  } else {
+    document.body.appendChild(row);
+  }
+  return row;
+}
+
+function renderBatchSummary() {
+  for (const key of ["found", "closed", "errored"]) {
+    const element = document.getElementById(`batch-summary-${key}`);
+    if (!element) continue;
+    element.textContent = String(batchCounts[key]);
+    if (key === "errored") {
+      const alarmed = batchCounts[key] > 0;
+      element.style.backgroundColor = alarmed ? "#ef5e74" : "transparent";
+      element.style.color = alarmed ? "#ffffff" : "#ef5e74";
+    }
+  }
+}
+
+function bumpBatchSummary(kind) {
+  batchCounts[kind]++;
+  renderBatchSummary();
+}
+
+function resetBatchSummary() {
+  batchCounts = { found: 0, closed: 0, errored: 0 };
+  ensureBatchSummary();
+  renderBatchSummary();
+  document.getElementById("batch-summary").style.display = "flex";
+}
+
+// Debug mode: one live card per route with its current outcome
+const DEBUG_STATES = {
+  pending: { label: "in flight...", css: "is-info is-light" },
+  found: { label: "Available", css: "is-success" },
+  notfound: { label: "Closed", css: "is-light" },
+  error: { label: "Errored", css: "is-danger" },
+};
+
+function isDebugMode() {
+  const checkbox = document.getElementById("debug-mode-checkbox");
+  return !!(checkbox && checkbox.checked);
+}
+
+// Per-route status cards. Every checked route gets one (in flight's final
+// value or an Available/Closed/Errored tag); they are part of the result list
+// at all times, but only visible when the "Show detailed log" toggle is on.
+// Visibility is a container class, so flipping the toggle is retroactive.
+function ensureRouteCards() {
+  let container = document.getElementById("route-cards");
+  if (!container) {
+    const routeList = document.querySelector(".route-list");
+    if (!routeList) return null;
+    container = document.createElement("div");
+    container.id = "route-cards";
+    container.className = "route-cards";
+    if (isDebugMode()) container.classList.add("show-details");
+    routeList.prepend(container);
+  }
+  return container;
+}
+
+function applyStatusToCard(card, state, detail) {
+  const badge = card.querySelector(".route-status-badge");
+  badge.textContent = DEBUG_STATES[state].label;
+  badge.className = "tag route-status-badge";
+  DEBUG_STATES[state].css.split(" ").forEach((cls) => badge.classList.add(cls));
+
+  const detailDiv = card.querySelector(".route-status-detail");
+  if (detail) {
+    detailDiv.textContent = detail;
+    detailDiv.style.display = "block";
+  } else {
+    detailDiv.style.display = "none";
+  }
+}
+
+function createStatusCard(routeKey, routeLabel) {
+  // Matches the flight-item card style, in a smaller type; visibility is
+  // controlled by the .route-cards container class, not the card itself
+  const card = document.createElement("div");
+  card.id = `route-card-${routeKey}`;
+  card.className = "route-status-card";
+  card.style.padding = "10px";
+  card.style.marginBottom = "6px";
+  card.style.border = "1px solid #ddd";
+  card.style.borderRadius = "5px";
+  card.style.fontSize = "0.8em";
+
+  const headerRow = document.createElement("div");
+  headerRow.style.display = "flex";
+  headerRow.style.justifyContent = "space-between";
+  headerRow.style.alignItems = "center";
+
+  const routeSpan = document.createElement("span");
+  routeSpan.textContent = routeLabel;
+  headerRow.appendChild(routeSpan);
+
+  const badge = document.createElement("span");
+  badge.className = "tag route-status-badge";
+  headerRow.appendChild(badge);
+  card.appendChild(headerRow);
+
+  const detailDiv = document.createElement("div");
+  detailDiv.className = "route-status-detail";
+  detailDiv.style.display = "none";
+  detailDiv.style.color = "#7a7a7a";
+  detailDiv.style.marginTop = "4px";
+  card.appendChild(detailDiv);
+
+  return card;
+}
+
+// Live card (kept and updated during a batch, one per route)
+function setRouteCard(container, routeKey, routeLabel, state, detail) {
+  if (!container) return;
+  let card = document.getElementById(`route-card-${routeKey}`);
+  if (!card) {
+    card = createStatusCard(routeKey, routeLabel);
+    container.appendChild(card);
+  }
+  applyStatusToCard(card, state, detail);
+}
+
+// Session check: classify the current Wizz session without a full search
+// Session status: colored dot + status text in the header, left of the
+// refresh button. Kept the historical function name for the call sites.
+let currentSessionState = "unknown";
+
+function updateSessionChip(state) {
+  currentSessionState = state || "unknown";
+  const dot = document.getElementById("session-dot");
+  const text = document.getElementById("session-text");
+  if (!dot || !text) return;
+  const states = {
+    unknown: ["Session unknown", "#b5b5b5"],
+    checking: ["Checking session...", "#485fc7"],
+    valid: ["Session valid", "#48c774"],
+    expired: ["Session expired", "#ef5e74"],
+    ratelimited: ["Rate limited", "#f5a623"],
+    error: ["Check failed", "#f5a623"],
+  };
+  const [label, color] = states[state] || states.unknown;
+  text.textContent = label;
+  dot.style.backgroundColor = color;
+}
+
+function formatRemaining(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
+/**
+ * App only: compose a real countdown into the session header from the JWT
+ * `exp` claim of the captured token. Runs every 15 s.
+ */
+function updateTokenCountdown() {
+  if (typeof Android === "undefined") return;
+  const dot = document.getElementById("session-dot");
+  const text = document.getElementById("session-text");
+  if (!dot || !text) return;
+
+  let info;
+  try {
+    info = JSON.parse(Android.getTokenInfo());
+  } catch (e) {
+    return;
+  }
+  if (!info || !info.hasToken) return;
+
+  const remaining = info.expiresAtEpochSeconds * 1000 - Date.now();
+  if (remaining <= 0) {
+    if (currentSessionState === "valid") {
+      text.textContent = "Session token expired — re-login advised";
+      dot.style.backgroundColor = "#ef5e74";
+    }
+    return;
+  }
+  if (currentSessionState !== "valid" && currentSessionState !== "checking") return;
+
+  const minutesLeft = remaining / 60000;
+  const color = minutesLeft < 2 ? "#f5a623" : "#48c774";
+  text.textContent = `Session valid · token expires in ${formatRemaining(remaining)}`;
+  dot.style.backgroundColor = color;
+}
+
+function classifySessionStatus(status) {
+  if (status === 401 || status === 403) return "expired";
+  if (status === 429) return "ratelimited";
+  if (status === 0) return "error";
+  return "valid";
+}
+
+// Toggle the session button between a plain check and a page-reload retry
+function updateSessionButton(reloadMode) {
+  const button = document.getElementById("check-session");
+  if (!button) return;
+  button.textContent = reloadMode ? "Reload page to check session" : "Refresh status";
+  button.dataset.mode = reloadMode ? "reload" : "check";
+}
+
+// Reload the multipass tab, then re-run the session check once it settles
+function reloadPageAndCheckSession() {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const tab = tabs[0];
+    if (!tab || !tab.url || !tab.url.includes("multipass.wizzair.com")) {
+      updateSessionChip("error");
+      return;
+    }
+    updateSessionChip("checking");
+    chrome.tabs.reload(tab.id, {}, () => {
+      chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
+        if (tabId !== tab.id || info.status !== "complete") return;
+        chrome.tabs.onUpdated.removeListener(listener);
+        // give the content script and the SPA a moment to initialize
+        setTimeout(checkSessionStatus, 2000);
+      });
+    });
+  });
+}
+
+async function checkSessionStatus() {
+  updateSessionChip("checking");
+  try {
+    if (typeof Android !== "undefined") {
+      const response = JSON.parse(Android.checkSession());
+      const state = classifySessionStatus(response.status);
+      console.log(`Session check: status=${response.status} state=${state}`);
+      updateSessionChip(state);
+      if (state === "expired") {
+        Android.forceReLogin();
+      }
+      return state;
+    }
+
+    // Chrome extension: probe from the multipass page via the content script
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.url || !tab.url.includes("multipass.wizzair.com")) {
+      updateSessionChip("error");
+      throw new Error("Open the Wizz Air Multipass page to check the session");
+    }
+    const response = await new Promise((resolve) => {
+      chrome.tabs.sendMessage(tab.id, { action: "checkSession" }, (res) => {
+        if (chrome.runtime.lastError) {
+          resolve(undefined);
+        } else {
+          resolve(res);
+        }
+      });
+    });
+    console.log("checkSession response from content script:", response);
+    if (response && typeof response.status === "number") {
+      const state = classifySessionStatus(response.status);
+      console.log(
+        `Session check: status=${response.status} state=${state} body=${(response.body || "").slice(0, 300)}`
+      );
+      updateSessionChip(state);
+      updateSessionButton(false);
+      return state;
+    } else {
+      console.error("Session check: no valid response (content script missing? reload the multipass page)");
+      updateSessionChip("error");
+      updateSessionButton(true);
+    }
+  } catch (error) {
+    console.error("Session check failed:", error);
+    updateSessionChip("error");
+  }
+  return "error";
+}
 
 function loadSearchHistory() {
   try {
@@ -189,7 +982,7 @@ function loadSearchHistory() {
   }
 }
 
-function saveToHistory(searchType, origin, selectedDate, results) {
+function saveToHistory(searchType, origin, selectedDate, results, outcomes = []) {
   if (!results || results.length === 0) return;
   const history = loadSearchHistory();
   history.unshift({
@@ -199,6 +992,7 @@ function saveToHistory(searchType, origin, selectedDate, results) {
     date: selectedDate,
     timestamp: Date.now(),
     results: results,
+    outcomes: outcomes,
   });
   while (history.length > HISTORY_LIMIT) {
     history.pop();
@@ -222,29 +1016,35 @@ function showSearchHistory() {
   if (!resultsDiv) return;
   resultsDiv.innerHTML = "";
 
+  // Dashboard and progress bar are live-view furniture: hidden in history
+  // (also while a batch is running), restored by the Find Routes tab
+  const summary = document.getElementById("batch-summary");
+  if (summary) summary.style.display = "none";
+  const bar = document.getElementById("batch-bar");
+  if (bar) bar.style.display = "none";
+
   resultsDiv.style.fontFamily = "Arial, sans-serif";
   resultsDiv.style.maxWidth = "600px";
   resultsDiv.style.margin = "0 auto";
 
-  const header = document.createElement("div");
-  header.style.display = "flex";
-  header.style.justifyContent = "space-between";
-  header.style.alignItems = "center";
-  header.style.marginBottom = "10px";
-
-  const title = document.createElement("h2");
-  title.textContent = "Search History";
-  header.appendChild(title);
-
-  if (history.length !== 0) {
+  // History mode: Start is out of context here; a same-sized Clear All takes
+  // its full-width slot. No in-list header — the tab already names the view.
+  const startButton = document.getElementById("search-flights");
+  if (startButton) startButton.style.display = "none";
+  if (history.length !== 0 && startButton && startButton.parentNode) {
+    document.getElementById("history-clear-all")?.remove();
     const clearAllButton = document.createElement("button");
+    clearAllButton.id = "history-clear-all";
     clearAllButton.textContent = "Clear All";
-    clearAllButton.classList.add("button", "is-small", "is-danger", "is-light");
+    clearAllButton.classList.add(
+      "button",
+      "is-danger",
+      "is-fullwidth",
+      "mt-3"
+    );
     clearAllButton.addEventListener("click", clearSearchHistory);
-    header.appendChild(clearAllButton);
+    startButton.parentNode.insertBefore(clearAllButton, startButton);
   }
-
-  resultsDiv.appendChild(header);
 
   if (history.length === 0) {
     const emptyMessage = document.createElement("p");
@@ -268,7 +1068,7 @@ function showSearchHistory() {
     viewButton.style.textAlign = "left";
     viewButton.textContent = `${entry.origin} (${typeLabel}) on ${entry.date} - ${entry.results.length} flights`;
     viewButton.addEventListener("click", () => {
-      displayResults({ [entry.date]: entry.results });
+      displayResults({ [entry.date]: entry.results }, false, entry.outcomes || []);
     });
     row.appendChild(viewButton);
 
@@ -308,22 +1108,51 @@ async function checkRoute(origin, destination, date) {
 
     if (typeof Android !== "undefined") {
       // Route the API call through the native bridge to avoid CORS issues
+      const callStart = Date.now();
       const responseJson = Android.checkRoute(dynamicUrl, JSON.stringify(data));
       const response = JSON.parse(responseJson);
-
+      logApiCall(
+        `${origin}->${destination}`,
+        response.status,
+        Date.now() - callStart,
+        String(response.body),
+        response.headers
+      );
       if (response.status === 429) {
-        document.querySelector("#rate-limited-message").style.display = "block";
-        throw new Error("429 Rate limited");
+        console.log("429 response body:", String(response.body).slice(0, 500));
+        throw makeRateLimitError(getRetryAfterSeconds(response.headers));
       }
       if (response.status === 401 || response.status === 403) {
         Android.forceReLogin();
         throw new Error("Session expired. Please log in to Wizz Air again.");
       }
-      if (response.status >= 400) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+
+      const bodyText = String(response.body);
+      if (bodyText.trimStart().startsWith("<")) {
+        // Wizz serves the SPA's HTML wrapper (with HTTP 200) when the dynamic
+        // URL/session is stale; the batch refreshes the capture and retries
+        console.error("Availability endpoint returned HTML instead of JSON — captured session is stale");
+        Android.forceReLogin();
+        throw makeStaleUrlError("Wizz returned HTML instead of JSON. The captured session is stale; refreshing it and retrying.");
       }
 
-      const responseData = JSON.parse(response.body);
+      let responseData;
+      try {
+        responseData = JSON.parse(bodyText);
+      } catch (parseError) {
+        if (response.status >= 400) {
+          throw makeHttpError(response.status, bodyText);
+        }
+        throw parseError;
+      }
+      // 400 error.availability = Wizz-speak for "nothing on this route/date"
+      if (responseData && responseData.code === "error.availability") {
+        return [];
+      }
+      if (response.status >= 400) {
+        throw makeHttpError(response.status, bodyText);
+      }
+
       return responseData.flightsOutbound || [];
     }
 
@@ -348,23 +1177,67 @@ async function checkRoute(origin, destination, date) {
       }
     }
 
+    const fetchStart = Date.now();
     const fetchResponse = await fetch(dynamicUrl, {
       method: "POST",
       headers: headers,
       body: JSON.stringify(data),
     });
+    const responseText = await fetchResponse.text();
 
-    if (!fetchResponse.ok) {
-      throw new Error(`HTTP error! status: ${fetchResponse.status}`);
+    if (fetchResponse.status === 429) {
+      const headerObj = {};
+      fetchResponse.headers.forEach((value, name) => {
+        headerObj[name] = value;
+      });
+      console.log("429 response body:", responseText.slice(0, 500));
+      logApiCall(
+        `${origin}->${destination}`,
+        429,
+        Date.now() - fetchStart,
+        responseText,
+        headerObj
+      );
+      throw makeRateLimitError(getRetryAfterSeconds(headerObj));
     }
 
-    const responseData = await fetchResponse.json();
+    logApiCall(
+      `${origin}->${destination}`,
+      fetchResponse.status,
+      Date.now() - fetchStart,
+      responseText
+    );
+
+    if (responseText.trimStart().startsWith("<")) {
+      // HTML with HTTP 200 means the cached dynamic URL is stale; mark the
+      // error retryable — the batch then reloads the Wizz page (the source of
+      // the URL) and retries with a fresh capture
+      console.error("Availability endpoint returned HTML instead of JSON — cached dynamic URL is stale, dropping it");
+      const pageData = JSON.parse(localStorage.getItem("wizz_page_data") || "{}");
+      delete pageData.dynamicUrl;
+      localStorage.setItem("wizz_page_data", JSON.stringify(pageData));
+      throw makeStaleUrlError("Wizz returned HTML instead of JSON (stale search endpoint — refreshing the Wizz page and retrying).");
+    }
+
+    let responseData;
+    try {
+      responseData = JSON.parse(responseText);
+    } catch (parseError) {
+      if (!fetchResponse.ok) {
+        throw makeHttpError(fetchResponse.status, responseText);
+      }
+      throw parseError;
+    }
+    // 400 error.availability = Wizz-speak for "nothing on this route/date"
+    if (responseData && responseData.code === "error.availability") {
+      return [];
+    }
+    if (!fetchResponse.ok) {
+      throw makeHttpError(fetchResponse.status, responseText);
+    }
     return responseData.flightsOutbound || [];
   } catch (error) {
     console.error("Error in checkRoute:", error);
-    if (error.message.includes("429")) {
-      document.querySelector("#rate-limited-message").style.display = "block";
-    }
     throw error;
   }
 }
@@ -372,468 +1245,389 @@ async function checkRoute(origin, destination, date) {
 async function checkAllRoutes() {
   console.log("checkAllRoutes started");
 
-  const audioCheckbox = document.getElementById("play-audio-checkbox");
-  const audioPlayer = document.getElementById("background-music");
-  if (audioCheckbox.checked && audioPlayer) {
-    audioPlayer.play();
-  }
-
   const originInput = document.getElementById("airport-input");
-  const dateSelect = document.getElementById("date-select");
-  const origin = originInput.value.toUpperCase();
-  const selectedDate = dateSelect.value;
-  const searchType = document.querySelector('input[name="searchType"]:checked').value;
+  const origin =
+    resolveAirportInput(originInput.value) || originInput.value.toUpperCase();
+  const selectedDate = getSelectedDate();
+  const searchType = getSearchType();
 
   if (!origin) {
     alert("Please enter an airport code.");
     return;
   }
 
-  // Clear previous results
-  let routeListElement = document.querySelector(".route-list");
-  document.querySelector("#rate-limited-message").style.display = "none";
-  routeListElement.innerHTML = "";
+  // The same button starts and stops: while a batch runs, clicking it aborts
+  if (batchRunning) {
+    console.log("Stop pressed: aborting the batch");
+    batchAborted = true;
+    return;
+  }
 
+  batchRunning = true;
+  batchAborted = false;
+  setMainButtonRunning(true);
+  ensureBatchBar();
+  updateBatchBar("Checking session...", 0);
+
+  let routeListElement = document.querySelector(".route-list");
   const flightsByDate = {};
 
+  try {
+    if (!routeListElement) {
+      throw new Error(".route-list element not found in the DOM");
+    }
+
+    // Probe session/token health first: only a definite "valid" starts a batch
+    const sessionState = await checkSessionStatus();
+    if (sessionState !== "valid") {
+      console.log(`Check Routes aborted: session state is ${sessionState}`);
+      if (sessionState === "expired") {
+        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Session expired. Please log in to Wizz Air and try again.</p>`;
+      } else if (sessionState === "ratelimited") {
+        document.querySelector("#rate-limited-message").style.display = "block";
+      } else {
+        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Could not verify the session. Use Check session (in the browser: reload the multipass page) and try again.</p>`;
+        if (typeof Android !== "undefined") {
+          Android.openWizzLogin();
+        }
+      }
+      return;
+    }
+
+    // Clear previous results
+    document.querySelector("#rate-limited-message").style.display = "none";
+    routeListElement.innerHTML = "";
+
+    updateBatchBar("Waiting for Wizz Air routes...", 0);
+    const destinations = await fetchDestinations(origin, searchType);
+    console.log("Fetched destinations:", destinations.length, "routes");
+    refreshAirportSuggestions();
+
+    updateBatchBar(`0/${destinations.length}`, 0);
+    resetBatchSummary();
+
+    // Live per-route status cards, kept in sync during the batch; the
+    // "Show detailed log" toggle only flips this container's visibility
+    const cardContainer = ensureRouteCards();
+
+    const results = [];
+    const outcomes = [];
+    let completedRoutes = 0;
+    let isRateLimited = false;
+    let staleRefreshes = 0;
+    const MAX_STALE_REFRESHES = 3;
+
+    for (const destination of destinations) {
+      if (batchAborted) {
+        console.log("Batch stopped by user");
+        break;
+      }
+      if (isRateLimited) break;
+
+      if (completedRoutes > 0 && completedRoutes % 25 === 0) {
+        await abortableSleep(15000, (remaining) => {
+          const seconds = Math.ceil(remaining / 1000);
+          updateBatchBar(
+            `Pausing ${seconds}s to avoid rate limiting (${completedRoutes}/${destinations.length})`,
+            completedRoutes / destinations.length
+          );
+        });
+        if (batchAborted) {
+          console.log("Batch stopped by user during cooldown");
+          break;
+        }
+      }
+
+      const apiOrigin = searchType === "arrive" ? destination : origin;
+      const apiDestination = searchType === "arrive" ? origin : destination;
+      const routeLabel = `${apiOrigin} to ${apiDestination}`;
+
+      updateBatchBar(
+        `Checking ${routeLabel}... ${completedRoutes}/${destinations.length}`,
+        completedRoutes / destinations.length
+      );
+
+      const routeKey = `${apiOrigin}-${apiDestination}`.replace(/[^A-Za-z0-9-]/g, "_");
+      setRouteCard(cardContainer, routeKey, routeLabel, "pending");
+
+      let routeComplete = false;
+      let backoffsForRoute = 0;
+      while (!routeComplete && !batchAborted && !isRateLimited) {
+        try {
+          const flights = await checkRoute(apiOrigin, apiDestination, selectedDate);
+          routeComplete = true;
+          if (flights && flights.length > 0) {
+            bumpBatchSummary("found");
+            const detail = `${flights.length} flights`;
+            setRouteCard(cardContainer, routeKey, routeLabel, "found", detail);
+            outcomes.push({ route: routeLabel, status: "available", detail: detail });
+            flights.forEach((flight) => {
+              const flightInfo = {
+                route: `${apiOrigin} (${flight.departureStationText}) to ${apiDestination} (${flight.arrivalStationText}) - ${flight.flightCode}`,
+                date: flight.departureDate,
+                departure: `${flight.departure} (${flight.departureOffsetText})`,
+                arrival: `${flight.arrival} (${flight.arrivalOffsetText})`,
+                duration: flight.duration,
+              };
+
+              results.push(flightInfo);
+
+              if (!flightsByDate[selectedDate]) {
+                flightsByDate[selectedDate] = [];
+              }
+              flightsByDate[selectedDate].push(flightInfo);
+              displayResults(flightsByDate, true);
+            });
+          } else {
+            bumpBatchSummary("closed");
+            setRouteCard(cardContainer, routeKey, routeLabel, "notfound");
+            outcomes.push({ route: routeLabel, status: "closed", detail: "" });
+          }
+        } catch (error) {
+          console.error(
+            `Error processing ${apiOrigin} to ${apiDestination} on ${selectedDate}:`,
+            error.message
+          );
+
+          if (error.isRateLimit) {
+            backoffsForRoute++;
+            if (backoffsForRoute > MAX_BACKOFFS_PER_BATCH) {
+              console.error(`Giving up: still rate limited after ${MAX_BACKOFFS_PER_BATCH} backoffs`);
+              const detail = `Gave up after ${backoffsForRoute - 1} backoffs (rate limited)`;
+              bumpBatchSummary("errored");
+              setRouteCard(cardContainer, routeKey, routeLabel, "error", detail);
+              outcomes.push({ route: routeLabel, status: "errored", detail: detail });
+              isRateLimited = true;
+              document.querySelector("#rate-limited-message").style.display =
+                "block";
+              break;
+            }
+            // Honor Wizz's requested back-off, then retry the same route
+            const wait = error.backoffSeconds || DEFAULT_BACKOFF_SECONDS;
+            console.log(`Backing off ${wait}s at Wizz's request (retry ${backoffsForRoute}/${MAX_BACKOFFS_PER_BATCH})`);
+            updateBatchBar(
+              `Backing off ${wait}s at Wizz's request (${completedRoutes}/${destinations.length})`,
+              completedRoutes / destinations.length
+            );
+            await abortableSleep(wait * 1000, (remaining) => {
+              updateBatchBar(
+                `Backing off ${Math.ceil(remaining / 1000)}s at Wizz's request (${completedRoutes}/${destinations.length})`,
+                completedRoutes / destinations.length
+              );
+            });
+            if (batchAborted) {
+              console.log("Batch stopped by user during rate-limit backoff");
+              break;
+            }
+            updateBatchBar(
+              `Retrying ${apiOrigin} to ${apiDestination}... ${completedRoutes}/${destinations.length}`,
+              completedRoutes / destinations.length
+            );
+            continue;
+          }
+
+          if (error.isStaleUrl) {
+            if (staleRefreshes >= MAX_STALE_REFRESHES) {
+              console.error(`Giving up: still returning HTML after ${MAX_STALE_REFRESHES} refreshes`);
+              const detail = `Gave up after ${MAX_STALE_REFRESHES} refreshes (Wizz keeps returning HTML)`;
+              routeComplete = true;
+              bumpBatchSummary("errored");
+              setRouteCard(cardContainer, routeKey, routeLabel, "error", detail);
+              outcomes.push({ route: routeLabel, status: "errored", detail: detail });
+            } else {
+              staleRefreshes++;
+              console.log(`Stale search endpoint: refreshing the Wizz page (refresh ${staleRefreshes}/${MAX_STALE_REFRESHES})`);
+              updateBatchBar(
+                `Stale URL, reloading Wizz page... (${completedRoutes}/${destinations.length})`,
+                completedRoutes / destinations.length
+              );
+              const refreshed = await refreshDynamicSource();
+              if (refreshed) {
+                updateBatchBar(
+                  `Retrying ${apiOrigin} to ${apiDestination}... ${completedRoutes}/${destinations.length}`,
+                  completedRoutes / destinations.length
+                );
+                continue;
+              }
+              if (batchAborted) break;
+              const detail = "Stale search endpoint and the Wizz page could not be refreshed";
+              routeComplete = true;
+              bumpBatchSummary("errored");
+              setRouteCard(cardContainer, routeKey, routeLabel, "error", detail);
+              outcomes.push({ route: routeLabel, status: "errored", detail: detail });
+            }
+          } else {
+            routeComplete = true;
+            bumpBatchSummary("errored");
+            setRouteCard(cardContainer, routeKey, routeLabel, "error", error.message);
+            outcomes.push({ route: routeLabel, status: "errored", detail: error.message });
+          }
+        }
+      }
+
+      if (isRateLimited) break;
+
+      completedRoutes++;
+      updateBatchBar(
+        `${completedRoutes}/${destinations.length}`,
+        completedRoutes / destinations.length
+      );
+      await abortableSleep(200);
+    }
+
+    removeBatchBar();
+
+    if (batchAborted) {
+      console.log(`Batch aborted after ${completedRoutes}/${destinations.length}; keeping partial results`);
+      if (routeListElement.children.length === 0) {
+        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Stopped by user. Nothing Available yet.</p>`;
+      }
+    } else if (!isRateLimited) {
+      if (results.length === 0) {
+        showBatchNotice(`All routes Closed for ${selectedDate}.`);
+      } else {
+        // No re-render here: the live-appended date headers, flight cards and
+        // status cards already on screen ARE the final view, and wiping them
+        // would also wipe the retroactive outcome cards
+        saveToHistory(
+          searchType,
+          origin,
+          selectedDate,
+          flightsByDate[selectedDate] || [],
+          outcomes
+        );
+      }
+    }
+  } catch (error) {
+    console.error("An error occurred:", error.message);
+    if (routeListElement) {
+      routeListElement.innerHTML = `<p>Error: ${error.message}</p>`;
+    }
+  } finally {
+    batchRunning = false;
+    batchAborted = false;
+    setMainButtonRunning(false);
+    removeBatchBar();
+  }
+}
+
+function displayResults(flightsByDate, append = false, outcomes = null) {
+  const routeListElement = document.querySelector(".route-list");
   if (!routeListElement) {
     console.error("Error: .route-list element not found in the DOM");
     return;
   }
 
-  try {
-    const destinations = await fetchDestinations(origin);
-    console.log("Fetched destinations:", destinations);
-
-    const progressElement = document.createElement("div");
-    progressElement.id = "progress";
-    progressElement.style.marginBottom = "10px";
-    routeListElement.insertBefore(progressElement, routeListElement.firstChild);
-
-    const results = [];
-    let completedRoutes = 0;
-    let isRateLimited = false;
-
-    for (const destination of destinations) {
-      if (isRateLimited) break;
-
-      if (completedRoutes > 0 && completedRoutes % 25 === 0) {
-        progressElement.textContent = `Taking a 15 second break to avoid rate limiting...`;
-        await new Promise((resolve) => setTimeout(resolve, 15000));
-      }
-
-      const apiOrigin = searchType === "arrive" ? destination : origin;
-      const apiDestination = searchType === "arrive" ? origin : destination;
-
-      const updateProgress = () => {
-        progressElement.textContent = `Checking ${apiOrigin} to ${apiDestination}... ${completedRoutes}/${destinations.length}`;
-      };
-      try {
-        const flights = await checkRoute(apiOrigin, apiDestination, selectedDate);
-        if (flights && flights.length > 0) {
-          flights.forEach((flight) => {
-            const flightInfo = {
-              route: `${apiOrigin} (${flight.departureStationText}) to ${apiDestination} (${flight.arrivalStationText}) - ${flight.flightCode}`,
-              date: flight.departureDate,
-              departure: `${flight.departure} (${flight.departureOffsetText})`,
-              arrival: `${flight.arrival} (${flight.arrivalOffsetText})`,
-              duration: flight.duration,
-            };
-
-            results.push(flightInfo);
-
-            if (!flightsByDate[selectedDate]) {
-              flightsByDate[selectedDate] = [];
-            }
-            flightsByDate[selectedDate].push(flightInfo);
-            displayResults(flightsByDate, true);
-          });
-        }
-      } catch (error) {
-        console.error(
-          `Error processing ${origin} to ${destination} on ${selectedDate}:`,
-          error.message
-        );
-
-        if (
-          error.message.includes("429") ||
-          error.message.includes("Rate limited")
-        ) {
-          isRateLimited = true;
-          document.querySelector("#rate-limited-message").style.display =
-            "block";
-          break;
-        }
-      }
-
-      completedRoutes++;
-      updateProgress();
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    }
-
-    progressElement.remove();
-
-    if (!isRateLimited) {
-      if (results.length === 0) {
-        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">No flights available for ${selectedDate}.</p>`;
-      } else {
-        await displayResults(flightsByDate);
-        saveToHistory(searchType, origin, selectedDate, flightsByDate[selectedDate]);
-      }
-
-      const audioPlayer = document.getElementById("background-music");
-      if (audioPlayer) {
-        audioPlayer.pause();
-        audioPlayer.remove();
-      }
-    }
-  } catch (error) {
-    console.error("An error occurred:", error.message);
-    routeListElement.innerHTML = `<p>Error: ${error.message}</p>`;
-
-    const audioPlayer = document.getElementById("background-music");
-    if (audioPlayer) {
-      audioPlayer.pause();
-      audioPlayer.remove();
-    }
-  }
-}
-
-function formatDate(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function displayResults(flightsByDate, append = false) {
-  const resultsDiv = document.querySelector(".route-list");
-  if (!resultsDiv) {
-    console.error("Error: .route-list element not found in the DOM");
-    return;
-  }
-
   if (!append) {
-    resultsDiv.innerHTML = "";
+    routeListElement.innerHTML = "";
   }
 
-  resultsDiv.style.fontFamily = "Arial, sans-serif";
-  resultsDiv.style.maxWidth = "600px";
-  resultsDiv.style.margin = "0 auto";
-
-  for (const [date, flights] of Object.entries(flightsByDate)) {
-    if (flights.length > 0) {
-      let dateHeader = append
-        ? resultsDiv.querySelector(`h3[data-date="${date}"]`)
-        : null;
-      let flightList = append
-        ? resultsDiv.querySelector(`ul[data-date="${date}"]`)
-        : null;
-
-      if (!dateHeader) {
-        dateHeader = document.createElement("h3");
-        dateHeader.setAttribute("data-date", date);
-        dateHeader.style.display = "flex";
-        dateHeader.style.justifyContent = "space-between";
-        dateHeader.style.alignItems = "center";
-        dateHeader.style.backgroundColor = "#f0f0f0";
-        dateHeader.style.padding = "10px";
-        dateHeader.style.borderRadius = "5px";
-
-        const dateText = document.createElement("span");
-        dateText.textContent = new Date(date).toLocaleDateString("en-US", {
-          weekday: "long",
-          day: "numeric",
-          month: "long",
-          year: "numeric",
-        });
-        dateHeader.appendChild(dateText);
-        resultsDiv.appendChild(dateHeader);
-      }
-
-      if (!flightList) {
-        flightList = document.createElement("ul");
-        flightList.setAttribute("data-date", date);
-        flightList.style.listStyleType = "none";
-        flightList.style.padding = "0";
-        resultsDiv.appendChild(flightList);
-      }
-
-      const flightsToProcess = append ? [flights[flights.length - 1]] : flights;
-
-      for (const flight of flightsToProcess) {
-        const flightItem = document.createElement("li");
-        flightItem.style.marginBottom = "15px";
-        flightItem.style.padding = "10px";
-        flightItem.style.border = "1px solid #ddd";
-        flightItem.style.borderRadius = "5px";
-        flightItem.style.display = "flex";
-        flightItem.style.flexDirection = "column";
-        flightItem.style.gap = "5px";
-
-        const routeDiv = document.createElement("div");
-        routeDiv.textContent = flight.route;
-        routeDiv.style.fontWeight = "bold";
-        routeDiv.style.marginBottom = "5px";
-
-        const detailsDiv = document.createElement("div");
-        detailsDiv.style.display = "flex";
-        detailsDiv.style.justifyContent = "space-between";
-
-        const departureDiv = document.createElement("div");
-        departureDiv.textContent = `✈️ Departure: ${flight.departure}`;
-
-        const arrivalDiv = document.createElement("div");
-        arrivalDiv.textContent = `🛬 Arrival: ${flight.arrival}`;
-
-        const durationDiv = document.createElement("div");
-        durationDiv.textContent = `⏱️ Duration: ${flight.duration}`;
-
-        detailsDiv.appendChild(departureDiv);
-        detailsDiv.appendChild(arrivalDiv);
-        detailsDiv.appendChild(durationDiv);
-
-        flightItem.appendChild(routeDiv);
-        flightItem.appendChild(detailsDiv);
-
-        const searchType = document.querySelector('input[name="searchType"]:checked').value;
-
-        if (searchType !== "arrive") {
-          const findReturnButton = document.createElement("button");
-          findReturnButton.textContent = "Find Return";
-          findReturnButton.style.width = "100px";
-          findReturnButton.classList.add(
-            "button",
-            "is-small",
-            "is-primary",
-            "mt-2",
-            "has-text-white",
-            "has-text-weight-bold",
-            "is-size-7"
-          );
-          findReturnButton.addEventListener("click", () => {
-            flight.element = flightItem;
-            findReturnFlight(flight);
-            findReturnButton.remove();
-          });
-          flightItem.appendChild(findReturnButton);
-        }
-
-        flightList.appendChild(flightItem);
-        flight.element = flightItem;
-      }
-    }
-  }
-}
-
-async function findReturnFlight(outboundFlight) {
-  const origin = outboundFlight.route.split(" to ")[1].split(" (")[0];
-  const destination = outboundFlight.route.split(" to ")[0].split(" (")[0];
-  const outboundDate = new Date(outboundFlight.date);
-  const outboundArrivalTime = outboundFlight.arrival.split(" (")[0];
-
-  const returnDates = [];
-  for (let i = 0; i < 4; i++) {
-    const date = new Date(outboundDate);
-    date.setDate(outboundDate.getDate() + i);
-    returnDates.push(formatDate(date));
-  }
-
-  const returnFlights = [];
-
-  const progressElement = document.createElement("div");
-  progressElement.classList.add("return-flight-progress");
-  progressElement.style.marginTop = "10px";
-  progressElement.style.fontSize = "0.9em";
-  progressElement.style.color = "#000";
-  outboundFlight.element.appendChild(progressElement);
-
-  let checkedDates = 0;
-  const updateProgress = () => {
-    progressElement.textContent = `Checking return flights: ${checkedDates} of ${returnDates.length} dates checked...`;
-  };
-
-  updateProgress();
-
-  for (const returnDate of returnDates) {
-    console.log(`Checking return flights for ${returnDate}`);
-    try {
-      const flights = await checkRoute(origin, destination, returnDate);
-      if (Array.isArray(flights)) {
-        const validReturnFlights = flights.filter((flight) => {
-          const [flightHours, flightMinutes] = flight.departure
-            .split(" (")[0]
-            .split(":");
-          const flightDate = new Date(returnDate);
-          flightDate.setHours(
-            parseInt(flightHours, 10),
-            parseInt(flightMinutes, 10),
-            0,
-            0
-          );
-
-          const [outboundHours, outboundMinutes] =
-            outboundArrivalTime.split(":");
-          const outboundArrival = new Date(outboundDate);
-          outboundArrival.setHours(
-            parseInt(outboundHours, 10),
-            parseInt(outboundMinutes, 10),
-            0,
-            0
-          );
-          return flightDate > outboundArrival;
-        });
-        console.log(
-          `Found ${validReturnFlights.length} valid return flights for ${returnDate}`
-        );
-        returnFlights.push(...validReturnFlights);
-      } else {
-        console.error(`Unexpected response format for ${returnDate}:`, flights);
-      }
-    } catch (error) {
-      console.error(`Error checking return flight for ${returnDate}:`, error);
-    }
-    checkedDates++;
-    updateProgress();
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-
-  progressElement.remove();
-
-  console.log(`Total return flights found: ${returnFlights.length}`);
-  displayReturnFlights(outboundFlight, returnFlights);
-
-  return returnFlights;
-}
-
-function calculateTimeAtDestination(outboundFlight, returnFlight) {
-  const outboundArrival = new Date(
-    `${outboundFlight.date} ${outboundFlight.arrival.split(" (")[0]}`
-  );
-  const returnDeparture = new Date(
-    `${returnFlight.departureDate} ${returnFlight.departure.split(" (")[0]}`
-  );
-
-  const timeDiff = returnDeparture - outboundArrival;
-  const days = Math.floor(timeDiff / (1000 * 60 * 60 * 24));
-  const hours = Math.floor(
-    (timeDiff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60)
-  );
-
-  return `${days} days and ${hours} hours`;
-}
-
-function displayReturnFlights(outboundFlight, returnFlights) {
-  const flightItem = outboundFlight.element;
-  if (!flightItem) {
-    console.error("Flight item element not found");
+  const dates = Object.keys(flightsByDate);
+  if (dates.length === 0) {
+    const section = document.createElement("div");
+    section.classList.add("route-date-header");
+    section.textContent = `All routes Closed for ${getSelectedDate()}`;
+    routeListElement.appendChild(section);
     return;
   }
 
-  const existingReturnFlights = flightItem.querySelector(".return-flights");
-  if (existingReturnFlights) {
-    existingReturnFlights.remove();
+  // Outcome cards first (Closed / Errored; visible only with the toggle on),
+  // then the date sections with the always-visible flight cards
+  if (!append && outcomes && outcomes.length > 0) {
+    const container = document.createElement("div");
+    container.className = "route-cards";
+    if (isDebugMode()) container.classList.add("show-details");
+    for (const outcome of outcomes) {
+      if (outcome.status === "available") continue;
+      // History entries store human statuses; map to DEBUG_STATES keys
+      const stateKey = outcome.status === "closed" ? "notfound" : "error";
+      const card = createStatusCard(`hist-${container.children.length}`, outcome.route);
+      applyStatusToCard(card, stateKey, outcome.detail);
+      container.appendChild(card);
+    }
+    routeListElement.appendChild(container);
   }
 
-  const returnFlightsDiv = document.createElement("div");
-  returnFlightsDiv.classList.add("return-flights");
-  returnFlightsDiv.style.marginTop = "15px";
-  returnFlightsDiv.style.borderTop = "2px solid #ddd";
-  returnFlightsDiv.style.paddingTop = "15px";
+  for (const date of dates) {
+    let dateHeader = append
+      ? routeListElement.querySelector(`h3[data-date="${date}"]`)
+      : null;
+    let flightList = append
+      ? routeListElement.querySelector(`ul[data-date="${date}"]`)
+      : null;
 
-  const validReturnFlights = returnFlights.filter((flight) => {
-    const timeAtDestination = calculateTimeAtDestination(
-      outboundFlight,
-      flight
-    );
-    const [days, hours] = timeAtDestination.split(" and ");
-    return parseInt(days) > 0 || parseInt(hours) >= 1;
-  });
+    if (!dateHeader) {
+      dateHeader = document.createElement("h3");
+      dateHeader.setAttribute("data-date", date);
+      dateHeader.classList.add("route-date-header");
+      dateHeader.style.backgroundColor = "#f0f0f0";
+      dateHeader.style.padding = "8px 10px";
+      dateHeader.style.borderRadius = "5px";
+      dateHeader.style.fontSize = "0.9em";
+      dateHeader.style.fontWeight = "bold";
+      dateHeader.style.color = "#4a4a4a";
+      dateHeader.textContent = new Date(date).toLocaleDateString("en-US", {
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+      });
+      routeListElement.appendChild(dateHeader);
+    }
 
-  const header = document.createElement("h4");
-  header.textContent = `Return Flights (${validReturnFlights.length} found)`;
-  header.style.marginBottom = "15px";
-  header.style.fontWeight = "bold";
-  returnFlightsDiv.appendChild(header);
+    if (!flightList) {
+      flightList = document.createElement("ul");
+      flightList.setAttribute("data-date", date);
+      flightList.style.listStyleType = "none";
+      flightList.style.padding = "0";
+      flightList.style.margin = "0 0 8px";
+      routeListElement.appendChild(flightList);
+    }
 
-  if (validReturnFlights.length === 0) {
-    const noFlightsMsg = document.createElement("p");
-    noFlightsMsg.textContent =
-      "No valid (>1h until return) flights found within the next 3 days.";
-    noFlightsMsg.style.fontStyle = "italic";
-    returnFlightsDiv.appendChild(noFlightsMsg);
-  } else {
-    const flightList = document.createElement("ul");
-    flightList.style.listStyleType = "none";
-    flightList.style.padding = "0";
+    // In append mode only the newest flight of each date is new; a full
+    // (non-append) render lists them all
+    const flightsToProcess = append ? [flightsByDate[date][flightsByDate[date].length - 1]] : flightsByDate[date];
 
-    validReturnFlights.forEach((flight) => {
-      const returnFlightItem = document.createElement("li");
-      returnFlightItem.style.marginBottom = "15px";
-      returnFlightItem.style.padding = "10px";
-      returnFlightItem.style.border = "1px solid #ddd";
-      returnFlightItem.style.borderRadius = "5px";
+    for (const flight of flightsToProcess) {
+      const flightItem = document.createElement("li");
+      flightItem.style.marginBottom = "15px";
+      flightItem.style.padding = "10px";
+      flightItem.style.border = "1px solid #ddd";
+      flightItem.style.borderRadius = "5px";
+      flightItem.style.display = "flex";
+      flightItem.style.flexDirection = "column";
+      flightItem.style.gap = "5px";
 
       const routeDiv = document.createElement("div");
-      routeDiv.textContent = `${
-        flight.departureStationText || flight.departureStation
-      } to ${flight.arrivalStationText || flight.arrivalStation} - ${
-        flight.flightCode
-      }`;
+      routeDiv.textContent = flight.route;
       routeDiv.style.fontWeight = "bold";
       routeDiv.style.marginBottom = "5px";
-
-      const dateDiv = document.createElement("div");
-      dateDiv.textContent = `Date: ${new Date(
-        flight.departureDate
-      ).toLocaleDateString()}`;
-      dateDiv.style.fontSize = "0.9rem";
-      dateDiv.style.color = "#4a4a4a";
-      dateDiv.style.marginBottom = "5px";
 
       const detailsDiv = document.createElement("div");
       detailsDiv.style.display = "flex";
       detailsDiv.style.justifyContent = "space-between";
-      detailsDiv.style.fontSize = "0.9em";
 
       const departureDiv = document.createElement("div");
-      departureDiv.textContent = `✈️ Departure: ${flight.departure} (${
-        flight.departureOffsetText || ""
-      })`;
+      departureDiv.textContent = `✈️ Departure: ${flight.departure}`;
 
       const arrivalDiv = document.createElement("div");
-      arrivalDiv.textContent = `🛬 Arrival: ${flight.arrival} (${
-        flight.arrivalOffsetText || ""
-      })`;
+      arrivalDiv.textContent = `🛬 Arrival: ${flight.arrival}`;
 
       const durationDiv = document.createElement("div");
       durationDiv.textContent = `⏱️ Duration: ${flight.duration}`;
-
-      const timeAtDestinationDiv = document.createElement("div");
-      const timeAtDestination = calculateTimeAtDestination(
-        outboundFlight,
-        flight
-      );
-      timeAtDestinationDiv.textContent = `🕒 Time until return: ${timeAtDestination}`;
-      timeAtDestinationDiv.style.fontSize = "0.9em";
-      timeAtDestinationDiv.style.color = "#4a4a4a";
-      timeAtDestinationDiv.style.marginTop = "5px";
+      durationDiv.style.fontSize = "0.85em";
+      durationDiv.style.color = "#7a7a7a";
 
       detailsDiv.appendChild(departureDiv);
       detailsDiv.appendChild(arrivalDiv);
-      detailsDiv.appendChild(durationDiv);
 
-      returnFlightItem.appendChild(routeDiv);
-      returnFlightItem.appendChild(dateDiv);
-      returnFlightItem.appendChild(detailsDiv);
-      returnFlightItem.appendChild(timeAtDestinationDiv);
-      flightList.appendChild(returnFlightItem);
-    });
+      flightItem.appendChild(routeDiv);
+      flightItem.appendChild(detailsDiv);
+      flightItem.appendChild(durationDiv);
 
-    returnFlightsDiv.appendChild(flightList);
+      flightList.appendChild(flightItem);
+    }
   }
-
-  flightItem.appendChild(returnFlightsDiv);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -841,60 +1635,24 @@ document.addEventListener("DOMContentLoaded", () => {
   const checkFlightsButton = document.getElementById("search-flights");
   const routeListElement = document.querySelector(".route-list");
   const airportInput = document.getElementById("airport-input");
-  const audioCheckbox = document.getElementById("play-audio-checkbox");
 
-  audioCheckbox.addEventListener("change", () => {
-    const existingPlayer = document.getElementById("background-music");
-    if (existingPlayer) {
-      existingPlayer.remove();
-    }
+  // state used to come from radio inputs; after the conversion to buttons,
+  // nothing flipped it.
+  document.querySelectorAll("#search-type-tabs .button").forEach((button) => {
+    button.addEventListener("click", () => {
+      document.querySelectorAll("#search-type-tabs .button").forEach((b) => {
+        const active = b === button;
+        b.classList.toggle("is-link", active);
+        b.classList.toggle("is-light", !active);
+      });
+      console.log(`Search type: ${getSearchType()}`);
+    });
   });
-
-  const lastAirport = localStorage.getItem("lastAirport");
-  if (lastAirport) {
-    airportInput.value = lastAirport;
-  }
-
-  airportInput.addEventListener("input", () => {
-    localStorage.setItem("lastAirport", airportInput.value.toUpperCase());
-  });
-
-  if (!routeListElement) {
-    console.error("Error: .route-list element not found in the DOM");
-  }
 
   if (checkFlightsButton) {
     console.log("Check Flights button found");
     checkFlightsButton.addEventListener("click", () => {
       console.log("Check Flights button clicked");
-
-      if (audioCheckbox.checked) {
-        const existingPlayer = document.getElementById("background-music");
-        if (!existingPlayer) {
-          const audioPlayer = document.createElement("audio");
-          audioPlayer.id = "background-music";
-          audioPlayer.controls = true;
-          audioPlayer.loop = true;
-          audioPlayer.style.position = "fixed";
-          audioPlayer.style.bottom = "10px";
-          audioPlayer.style.right = "10px";
-          audioPlayer.style.transform = "none";
-          audioPlayer.style.zIndex = "1000";
-          audioPlayer.style.width = "150px";
-          audioPlayer.style.height = "30px";
-          audioPlayer.controlsList =
-            "nodownload noplaybackrate nofullscreen noremoteplayback";
-          audioPlayer.style.webkitMediaControls = "play current-time";
-
-          const source = document.createElement("source");
-          source.src = "assets/background-music.mp3";
-          source.type = "audio/mpeg";
-
-          audioPlayer.appendChild(source);
-          document.body.appendChild(audioPlayer);
-          audioPlayer.play();
-        }
-      }
 
       checkAllRoutes().catch((error) => {
         console.error("Error in checkAllRoutes:", error);
@@ -907,35 +1665,206 @@ document.addEventListener("DOMContentLoaded", () => {
     console.error("Check Flights button not found");
   }
 
-  const historyButton = document.createElement("button");
-  historyButton.id = "show-history";
-  historyButton.textContent = "Search History";
-  historyButton.classList.add("button", "is-light", "mb-4");
-  if (checkFlightsButton) {
-    checkFlightsButton.parentNode.insertBefore(
-      historyButton,
-      checkFlightsButton.nextSibling
-    );
+  // Main tabs: Find Routes | Search History — attached buttons, one active
+  const tabsRow = document.createElement("div");
+  tabsRow.id = "main-tabs";
+  tabsRow.classList.add("buttons", "has-addons", "mb-3");
+  const findRoutesTab = document.createElement("button");
+  findRoutesTab.type = "button";
+  findRoutesTab.textContent = "Find Routes";
+  findRoutesTab.classList.add("button", "is-link");
+  const historyTab = document.createElement("button");
+  historyTab.type = "button";
+  historyTab.textContent = "Search History";
+  historyTab.classList.add("button", "is-light");
+  tabsRow.appendChild(findRoutesTab);
+  tabsRow.appendChild(historyTab);
+
+  const activateTab = (activeTab) => {
+    [findRoutesTab, historyTab].forEach((tab) => {
+      tab.classList.toggle("is-link", tab === activeTab);
+      tab.classList.toggle("is-light", tab !== activeTab);
+    });
+  };
+
+  findRoutesTab.addEventListener("click", () => {
+    activateTab(findRoutesTab);
+    const routeList = document.querySelector(".route-list");
+    if (routeList) routeList.innerHTML = "";
+    // Undo history mode: Start back in place, promoted Clear All away;
+    // dashboard and progress bar return too (they reflect the last batch)
+    const startButton = document.getElementById("search-flights");
+    if (startButton) startButton.style.display = "";
+    document.getElementById("history-clear-all")?.remove();
+    const summary = document.getElementById("batch-summary");
+    if (summary) summary.style.display = "flex";
+    const bar = document.getElementById("batch-bar");
+    if (bar) bar.style.display = "flex";
+  });
+  historyTab.addEventListener("click", () => {
+    activateTab(historyTab);
+    showSearchHistory();
+  });
+
+  // "Show detailed log" toggle: shows/hides the per-route status cards;
+  // cards are always built during a batch (and stored in history entries),
+  // the switch only flips their visibility — retroactively
+  const debugField = document.createElement("div");
+  debugField.id = "detailed-log-row";
+  debugField.className = "detailed-log-row";
+  debugField.innerHTML =
+    '<span class="switch-label">Show detailed log</span>' +
+    '<label class="wizz-switch"><input type="checkbox" id="debug-mode-checkbox"><span class="slider"></span></label>';
+  debugField
+    .querySelector("#debug-mode-checkbox")
+    .addEventListener("change", (event) => {
+      document.querySelectorAll(".route-cards").forEach((container) => {
+        container.classList.toggle("show-details", event.target.checked);
+      });
+    });
+
+  // Session header: dot + status text left, actions right
+  const sessionHeader = document.createElement("div");
+  sessionHeader.id = "session-header";
+  sessionHeader.classList.add("mb-4");
+  sessionHeader.style.display = "flex";
+  sessionHeader.style.alignItems = "center";
+  sessionHeader.style.justifyContent = "space-between";
+
+  const statusWrap = document.createElement("div");
+  statusWrap.style.display = "flex";
+  statusWrap.style.alignItems = "center";
+  statusWrap.style.gap = "8px";
+
+  const sessionDot = document.createElement("span");
+  sessionDot.id = "session-dot";
+  sessionDot.style.width = "10px";
+  sessionDot.style.height = "10px";
+  sessionDot.style.borderRadius = "50%";
+  sessionDot.style.backgroundColor = "#b5b5b5";
+  sessionDot.style.flexShrink = "0";
+  sessionDot.style.display = "inline-block";
+  statusWrap.appendChild(sessionDot);
+
+  const sessionText = document.createElement("span");
+  sessionText.id = "session-text";
+  sessionText.textContent = "Session unknown";
+  sessionText.style.fontSize = "0.85em";
+  statusWrap.appendChild(sessionText);
+  sessionHeader.appendChild(statusWrap);
+
+  const actionWrap = document.createElement("div");
+  actionWrap.style.display = "flex";
+  actionWrap.style.gap = "8px";
+
+  const sessionButton = document.createElement("button");
+  sessionButton.id = "check-session";
+  sessionButton.textContent = "Refresh status";
+  sessionButton.classList.add("button", "is-small", "is-light");
+  sessionButton.addEventListener("click", () => {
+    if (typeof Android === "undefined" && sessionButton.dataset.mode === "reload") {
+      reloadPageAndCheckSession();
+    } else {
+      sessionButton.dataset.mode = "check";
+      checkSessionStatus();
+    }
+  });
+  actionWrap.appendChild(sessionButton);
+
+  if (typeof Android !== "undefined") {
+    // App-only: open the Wizz webview to refresh the session; it auto-closes
+    // when the fresh token is captured
+    const reloginButton = document.createElement("button");
+    reloginButton.id = "open-wizz-session";
+    reloginButton.textContent = "Re-login";
+    reloginButton.classList.add("button", "is-small", "is-info", "is-light");
+    reloginButton.addEventListener("click", () => {
+      console.log("Re-login requested: opening Wizz session webview");
+      Android.forceReLogin();
+    });
+    actionWrap.appendChild(reloginButton);
   }
-  historyButton.addEventListener("click", showSearchHistory);
+
+  sessionHeader.appendChild(actionWrap);
+
+  // App-style header bar pinned to the top of the page, above all content
+  document.body.insertBefore(sessionHeader, document.body.firstChild);
+
+  if (checkFlightsButton) {
+    const parentNode = checkFlightsButton.parentNode;
+    parentNode.insertBefore(tabsRow, checkFlightsButton);
+    // "Show detailed log" sits just above the Find Routes | Search History tabs
+    parentNode.insertBefore(debugField, tabsRow);
+  }
+  if (routeListElement && routeListElement.parentNode) {
+    // keep in DOM even if insertion above failed; harmless fallback
+    if (!debugField.parentNode) {
+      routeListElement.parentNode.insertBefore(debugField, routeListElement);
+    }
+  }
+
+  // App only: live token expiry countdown in the session header
+  if (typeof Android !== "undefined") {
+    updateTokenCountdown();
+    setInterval(updateTokenCountdown, 15000);
+  }
+
+  refreshAirportSuggestions();
+  setupAirportDropdown();
 });
 
+/** The selected date, from the four calendar-style tab-buttons. */
+function getSelectedDate() {
+  const active = document.querySelector("#date-tabs .button.is-link");
+  return active ? active.getAttribute("data-date") : null;
+}
+
 document.addEventListener("DOMContentLoaded", function () {
-  const dateSelect = document.getElementById("date-select");
+  const dateTabs = document.getElementById("date-tabs");
   const today = new Date();
+  const buttons = [];
 
   for (let i = 0; i < 4; i++) {
     const date = new Date(today);
     date.setDate(today.getDate() + i);
 
-    const option = document.createElement("option");
-    option.value = date.toISOString().split("T")[0];
-    option.textContent = date.toLocaleDateString("en-US", {
-      weekday: "long",
+    const button = document.createElement("button");
+    button.type = "button";
+    button.classList.add("button");
+    button.dataset.date = date.toISOString().split("T")[0];
+
+    const monthDay = document.createElement("span");
+    monthDay.textContent = date.toLocaleDateString("en-US", {
       month: "short",
       day: "numeric",
     });
+    monthDay.classList.add("date-chip-title");
 
-    dateSelect.appendChild(option);
+    const weekday = document.createElement("span");
+    weekday.textContent = date.toLocaleDateString("en-US", {
+      weekday: "long",
+    });
+    weekday.classList.add("date-chip-caption");
+
+    // Title on top, weekday caption under it
+    button.appendChild(monthDay);
+    button.appendChild(weekday);
+
+    button.addEventListener("click", () => {
+      buttons.forEach((b) => {
+        const active = b === button;
+        b.classList.toggle("is-link", active);
+        b.classList.toggle("is-light", !active);
+      });
+      console.log(`Selected departure date: ${button.dataset.date}`);
+    });
+
+    dateTabs.appendChild(button);
+    buttons.push(button);
+  }
+  // Default: today
+  buttons[0].classList.add("is-link");
+  for (let i = 1; i < buttons.length; i++) {
+    buttons[i].classList.add("is-light");
   }
 });

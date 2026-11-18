@@ -3,15 +3,20 @@ package com.dgghita.wizzroutefinder
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.os.Bundle
+import android.util.Base64
+import android.util.Log
 import android.os.Handler
 import android.os.Looper
+import android.view.Gravity
 import android.view.View
+import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.Toast
 import org.json.JSONObject
@@ -24,6 +29,7 @@ class MainActivity : Activity() {
     private lateinit var root: FrameLayout
     private lateinit var mainWebView: WebView
     private lateinit var wizzWebView: WebView
+    private lateinit var closeWizzButton: Button
     private val handler = Handler(Looper.getMainLooper())
 
     private val authLock = Any()
@@ -32,6 +38,11 @@ class MainActivity : Activity() {
     @Volatile private var routesJson: String? = null
     @Volatile private var dynamicUrl: String? = null
     @Volatile private var notifiedDataReady = false
+
+    // Token expiry (from the JWT `exp` claim in the Authorization header), so
+    // the UI can show a real countdown
+    @Volatile private var tokenExpiryEpochSeconds: Long? = null
+    @Volatile private var tokenCapturedAtEpochSeconds: Long? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -47,6 +58,21 @@ class MainActivity : Activity() {
         root.addView(wizzWebView, FrameLayout.LayoutParams(-1, -1))
         wizzWebView.visibility = View.GONE
 
+        // Fixed X at the top of the (fullscreen) Wizz webview so the user is
+        // never stuck there
+        closeWizzButton = Button(this).apply {
+            text = "X Close"
+            visibility = View.GONE
+            setOnClickListener { hideWizzWebview() }
+        }
+        val closeParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.END
+        )
+        closeParams.setMargins(24, 96, 24, 0)
+        root.addView(closeWizzButton, closeParams)
+
         mainWebView.loadUrl("file:///android_asset/popup.html")
 
         if (routesJson == null || dynamicUrl == null) {
@@ -59,8 +85,24 @@ class MainActivity : Activity() {
         return WebView(this).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
-            webChromeClient = WebChromeClient()
+            webChromeClient = createConsoleForwardingClient("popup")
             addJavascriptInterface(WizzBridge(), "Android")
+        }
+    }
+
+    /** Mirror WebView console output to logcat so `adb logcat` shows JS logs. */
+    private fun createConsoleForwardingClient(source: String): WebChromeClient {
+        return object : WebChromeClient() {
+            override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                if (consoleMessage != null) {
+                    Log.d(
+                        TAG,
+                        "[$source] ${consoleMessage.message()} " +
+                            "(${consoleMessage.sourceId()}:${consoleMessage.lineNumber()})"
+                    )
+                }
+                return true
+            }
         }
     }
 
@@ -69,6 +111,7 @@ class MainActivity : Activity() {
         return WebView(this).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
+            webChromeClient = createConsoleForwardingClient("wizz")
             webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(
                     view: WebView,
@@ -77,11 +120,29 @@ class MainActivity : Activity() {
                     if (request.url.host?.endsWith("wizzair.com") == true) {
                         val headers = request.requestHeaders
                         if (!headers.isNullOrEmpty()) {
+                            val knownKeys: Set<String>
                             synchronized(authLock) {
+                                knownKeys = authHeaders.keys.toSet()
                                 for ((name, value) in headers) {
                                     if (name.lowercase() !in SKIP_CAPTURE_HEADERS) {
                                         authHeaders[name] = value
                                     }
+                                    if (name.equals("authorization", ignoreCase = true)) {
+                                        val expiry = parseJwtExpiry(value)
+                                        if (expiry != null && expiry != tokenExpiryEpochSeconds) {
+                                            tokenExpiryEpochSeconds = expiry
+                                            tokenCapturedAtEpochSeconds =
+                                                System.currentTimeMillis() / 1000
+                                            Log.d(
+                                                TAG,
+                                                "token expiry parsed: $expiry " +
+                                                    "(captured at ${tokenCapturedAtEpochSeconds})"
+                                            )
+                                        }
+                                    }
+                                }
+                                if (authHeaders.keys != knownKeys) {
+                                    Log.d(TAG, "captured headers: ${authHeaders.keys}")
                                 }
                             }
                         }
@@ -109,7 +170,16 @@ class MainActivity : Activity() {
             }
             wizzWebView.loadUrl(WALLETS_URL)
             wizzWebView.visibility = View.VISIBLE
+            closeWizzButton.visibility = View.VISIBLE
             mainWebView.visibility = View.GONE
+        }
+    }
+
+    private fun hideWizzWebview() {
+        handler.post {
+            wizzWebView.visibility = View.GONE
+            closeWizzButton.visibility = View.GONE
+            mainWebView.visibility = View.VISIBLE
         }
     }
 
@@ -121,7 +191,10 @@ class MainActivity : Activity() {
                 }.getOrNull()
                 if (!parsed.isNullOrBlank() && parsed != "null") {
                     routesJson = parsed
+                    Log.d(TAG, "routes extracted (${parsed.length} chars)")
                     notifyDataReady()
+                } else {
+                    Log.d(TAG, "routes extraction returned nothing yet")
                 }
             }
         }
@@ -132,7 +205,10 @@ class MainActivity : Activity() {
                 }.getOrNull()
                 if (!parsed.isNullOrBlank() && parsed != "null") {
                     dynamicUrl = parsed
+                    Log.d(TAG, "dynamic URL extracted: $parsed")
                     notifyDataReady()
+                } else {
+                    Log.d(TAG, "dynamic URL extraction returned nothing yet")
                 }
             }
         }
@@ -146,8 +222,7 @@ class MainActivity : Activity() {
         if (routesJson != null && dynamicUrl != null && !notifiedDataReady) {
             notifiedDataReady = true
             handler.post {
-                wizzWebView.visibility = View.GONE
-                mainWebView.visibility = View.VISIBLE
+                hideWizzWebview()
                 mainWebView.evaluateJavascript(
                     "window.__onWizzDataReady && window.__onWizzDataReady()",
                     null
@@ -160,8 +235,7 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         if (wizzWebView.visibility == View.VISIBLE) {
-            wizzWebView.visibility = View.GONE
-            mainWebView.visibility = View.VISIBLE
+            hideWizzWebview()
         } else {
             super.onBackPressed()
         }
@@ -192,6 +266,21 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun getDynamicUrl(): String = dynamicUrl ?: ""
 
+        /** JWT expiry info for the session countdown, or hasToken=false. */
+        @JavascriptInterface
+        fun getTokenInfo(): String {
+            val expiry = tokenExpiryEpochSeconds
+            return if (expiry == null) {
+                JSONObject().put("hasToken", false).toString()
+            } else {
+                JSONObject()
+                    .put("hasToken", true)
+                    .put("expiresAtEpochSeconds", expiry)
+                    .put("capturedAtEpochSeconds", tokenCapturedAtEpochSeconds ?: 0L)
+                    .toString()
+            }
+        }
+
         /**
          * Native POST to Wizz Air's availability endpoint. Runs on a bridge
          * worker thread; blocking here is safe (like the extension's fetch,
@@ -199,6 +288,32 @@ class MainActivity : Activity() {
          */
         @JavascriptInterface
         fun checkRoute(url: String, payloadJson: String): String {
+            return executePost(url, payloadJson, fullBodyLog = false)
+        }
+
+        /**
+         * Cheap session probe: a minimal availability POST. Wizz answers
+         * 401/403 when the session is dead regardless of payload, so any
+         * other status means the auth headers are still accepted.
+         */
+        @JavascriptInterface
+        fun checkSession(): String {
+            val url = dynamicUrl
+                ?: return JSONObject().put("status", 0).put("body", "no dynamic URL").toString()
+            val probePayload = JSONObject().apply {
+                put("flightType", "OW")
+                put("origin", "AAA")
+                put("destination", "BBB")
+                put("departure", "2030-01-01")
+                put("arrival", "")
+                put("intervalSubtype", JSONObject.NULL)
+            }
+            return executePost(url, probePayload.toString(), fullBodyLog = true)
+        }
+
+        private fun executePost(url: String, payloadJson: String, fullBodyLog: Boolean): String {
+            val startedAt = System.currentTimeMillis()
+            Log.d(TAG, "POST $url payload=$payloadJson")
             return try {
                 val connection = URL(url).openConnection() as HttpURLConnection
                 connection.requestMethod = "POST"
@@ -221,14 +336,55 @@ class MainActivity : Activity() {
                 val status = connection.responseCode
                 val stream = if (status in 200..299) connection.inputStream else connection.errorStream
                 val body = stream?.bufferedReader()?.use { it.readText() } ?: ""
-                JSONObject().put("status", status).put("body", body).toString()
+                val elapsed = System.currentTimeMillis() - startedAt
+                Log.d(TAG, "-> $status in ${elapsed}ms body: ${body.take(BODY_LOG_SNIPPET)}")
+                if (status == 429 && body.isNotEmpty()) {
+                    Log.w(TAG, "429 body: ${body.take(RATE_LIMIT_BODY_LOG)}")
+                }
+                val responseHeaders = JSONObject()
+                for ((name, value) in connection.headerFields) {
+                    if (name != null) {
+                        responseHeaders.put(name, value.joinToString(", "))
+                    }
+                }
+                JSONObject()
+                    .put("status", status)
+                    .put("body", body)
+                    .put("headers", responseHeaders)
+                    .toString()
             } catch (e: Exception) {
+                val elapsed = System.currentTimeMillis() - startedAt
+                Log.e(TAG, "-> failed after ${elapsed}ms: ${e.message}", e)
                 JSONObject().put("status", 0).put("body", e.message ?: e.javaClass.simpleName).toString()
             }
         }
     }
 
     companion object {
+        private const val TAG = "WizzFinder"
+        private const val BODY_LOG_SNIPPET = 200
+        private const val RATE_LIMIT_BODY_LOG = 1000
+
+        /** Decode the `exp` claim from a JWT-shaped Authorization value. */
+        private fun parseJwtExpiry(value: String): Long? {
+            val token = value.removePrefix("Bearer ").trim()
+            val parts = token.split(".")
+            if (parts.size != 3) return null
+            return try {
+                val payload = String(
+                    Base64.decode(
+                        parts[1],
+                        Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP
+                    ),
+                    Charsets.UTF_8
+                )
+                val exp = JSONObject(payload).optLong("exp", -1L)
+                if (exp > 0) exp else null
+            } catch (e: Exception) {
+                null
+            }
+        }
+
         private const val WALLETS_URL =
             "https://multipass.wizzair.com/w6/subscriptions/spa/private-page/wallets"
 

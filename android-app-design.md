@@ -101,11 +101,17 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
 - No waiting music. Visual only.
 - **Done when:** starting a search shows the bar; it counts up in real time;
   it disappears when the batch ends, is stopped, or fails.
+- **Pacing change (reactive-only):** the preventive every-25-routes 15 s
+  pause was dropped — in practice a 429 kept landing right after it, and the
+  jitter alone (now widened to a random 1-4 s between requests) plus
+  reactive backoff is the whole strategy. Back-offs still count down on the
+  bar and are Stop-interruptible.
 
 #### 2. Stop button
 - The **Start button turns into a red Stop** while a batch runs; clicking it
   aborts immediately: no further API calls, partial results stay rendered.
-- Must abort even during the 15 s cooldown sleeps and rate-limit back-offs.
+- Must abort even during rate-limit back-off sleeps (the preventive cooldown
+  sleeps are gone; See item 1's pacing change).
 - **Done when:** mid-batch Stop leaves the UI responsive, Start comes back
   green, no further calls fire (verifiable in logcat), partial results remain.
 
@@ -191,8 +197,9 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
   backoffs the batch gives up, shows the rate-limit banner, and keeps partial
   results.
 - HTTP errors carry the response body snippet in the user-visible message
-  instead of a bare `HTTP error! status: X`. Without `Retry-After`, a default
-  15 s back-off applies.
+  instead of a bare `HTTP error! status: X`. Without `Retry-After`, a random
+  10-20 s back-off applies (varies per 429 so retries don't lock into a
+  rhythm).
 - **Done when:** a mid-batch 429 recovers by itself if Wizz allows it, and the
   user always sees why a call failed.
 
@@ -349,6 +356,64 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
 - **Done when:** a batch started with the screen off still progresses
   (cards populate; check afterwards). On aggressive OEMs (Honor) battery
   settings may still need the app whitelisted from optimization.
+
+#### 13. Dark mode (light / dark / auto)
+- **Intent:** the user wants a real application look on device. A single
+  icon button in the session header (styled like the session chip)
+  cycles the theme light -> dark -> auto; the icon (sun / moon / monitor)
+  shows the active mode. The choice persists in
+  `localStorage["wizz-theme"]`; `auto` tracks `prefers-color-scheme` live
+  (listener re-applies on OS switch without reload).
+- **Scope:** chrome-wide dark mode in the shared UI (popup + app webviews)
+  and, as far as Android allows, the Wizz pages too. The extension popup and
+  the app main webview share the exact same CSS, so no platform split is
+  needed for the UI itself.
+- **Fix:** Bulma 1.0.2 natively supports `html[data-theme="dark"]`, so
+  setting that attribute flips every Bulma component. The custom CSS in
+  `shared/popup.html` is converted to CSS custom properties (one var set on
+  `:root`, one dark override on `html[data-theme="dark"]`) and every
+  hardcoded hex goes away. The few inline styles set from `shared/popup.js`
+  are switched to `var(...)` strings (browser accepts them). A tiny inline
+  script runs before first paint to resolve and set `data-theme`, avoiding a
+  light flash on dark phones. Only the *chrome* is currently under CSS the
+  shared style controls; the whiteish flash on webview load needs the
+  app-side native mainWebView background color fixed too.
+- **Fix (app, build 17):** the Wizz pages themselves get the same theme via
+  `settings.isAlgorithmicDarkeningAllowed = true` (API 33+, algorithmic
+  darkening) plus a `attachBaseContext` override forcing `uiMode`
+  (dark -> `UI_MODE_NIGHT_YES`) so the WebView sees night mode, saved as
+  `"app-theme"` in prefs. The JS bridge gains `setAppTheme(mode)` which
+  persists the pref and calls `recreate()`. The main window background is
+  set natively (dark when the override is on) to kill the white flash while
+  the webview loads, and the webview background is set to match.
+- **Done when:** the toggle flips every surface of the chrome to a readable
+  dark palette with no light-flash on open, persists across restarts, and
+  `auto` follows the system theme live; in the app the Wizz webview darkens
+  to match (native darkening, API 33+).
+- **Fix (first on-device round):** Bulma's `is-light` helpers (inactive tab
+  buttons, chips, history rows, delete buttons) resolve their background
+  from `--bulma-light-l`, which is 96% and static in the shipped build —
+  the dark block now overrides it (plus the three `*-light-invert-l` text
+  values), so inactive controls are inverted like active ones. The
+  "Show detailed log" label kept a literal `#363636`; converted.
+
+#### 14. Search history: accordion entries (no drill-down)
+- **Intent:** clicking a history entry used to replace the whole list with
+  its results, and the only way back was re-clicking the tab. Instead,
+  entries behave like accordion headings: the first click renders the
+  entry's results (date header, flight cards, and the closed/errored
+  outcome cards — unchanged markup, so the "Show detailed log" toggle
+  applies to them too) in a bordered panel right below the heading; a
+  second click hides it. A small rotating chevron signals the open state.
+- **Fix:** `displayResults` gained an optional target element (default
+  stays the live `.route-list`); history entries render into their own
+  panel lazily (once) and toggle `display`. "Clear All" keeps its
+  full-width slot but drops the hard red for the soft `is-light` danger
+  variant, matching the per-row Delete buttons — hard red stays reserved
+  for Stop and the error labels.
+- **Done when:** in the extension, an entry expands/collapses in place
+  (both in light and dark), the detailed-log toggle shows/hides the
+  outcome cards inside an open panel, and Clear All reads as a soft red.
 
 #### Explicitly out of scope for v2- Full UI overhaul (user intent: it's coming, after observability proves out).
 - (Token expiry countdown was moved into scope as item 7; a manual re-login

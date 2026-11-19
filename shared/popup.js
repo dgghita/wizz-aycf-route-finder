@@ -1,5 +1,50 @@
 console.log("popup.js loaded");
 
+/**
+ * Theme: light | dark | auto, persisted in localStorage["wizz-theme"].
+ * The head inline script in popup.html already set data-theme before first
+ * paint; this block owns the three-way toggle in the session header, the
+ * live system-change tracking for auto mode, and the app-side native sync.
+ */
+const THEME_KEY = "wizz-theme";
+const themeMedia = window.matchMedia("(prefers-color-scheme: dark)");
+
+function getThemeMode() {
+  try {
+    return localStorage.getItem(THEME_KEY) || "auto";
+  } catch (e) {
+    return "auto";
+  }
+}
+
+function resolveTheme(mode) {
+  return mode === "auto" ? (themeMedia.matches ? "dark" : "light") : mode;
+}
+
+function applyStoredTheme() {
+  document.documentElement.setAttribute(
+    "data-theme",
+    resolveTheme(getThemeMode())
+  );
+}
+
+function setThemeMode(mode) {
+  try {
+    localStorage.setItem(THEME_KEY, mode);
+  } catch (e) {}
+  document.documentElement.setAttribute("data-theme", resolveTheme(mode));
+  // App: persist on the native side (drives the Wizz webviews' darkening
+  // and the window background) and restart so attachBaseContext picks it up
+  if (typeof Android !== "undefined" && Android.setAppTheme) {
+    Android.setAppTheme(mode);
+  }
+}
+
+// Auto mode follows the OS theme switch live, without a reload
+themeMedia.addEventListener("change", () => {
+  if (getThemeMode() === "auto") applyStoredTheme();
+});
+
 function waitForWizzData(timeoutMs = 300000) {
   return new Promise((resolve, reject) => {
     const getData = () => {
@@ -542,7 +587,10 @@ function getRetryAfterSeconds(headers) {
 }
 
 function makeRateLimitError(backoffSeconds) {
-  const wait = backoffSeconds || DEFAULT_BACKOFF_SECONDS;
+  // No Retry-After from Wizz: fall back to a random 10-20 s, so repeated
+  // 429s don't synchronize into a fixed rhythm
+  const wait =
+    backoffSeconds || Math.floor(Math.random() * 11) + 10;
   const error = new Error(
     backoffSeconds
       ? `Wizz asked us to back off for ${wait}s; retrying automatically`
@@ -588,11 +636,11 @@ function showBatchNotice(text, container) {
   notice.style.display = "flex";
   notice.style.alignItems = "center";
   notice.style.justifyContent = "center";
-  notice.style.backgroundColor = "#f0f0f0";
+  notice.style.backgroundColor = "var(--wizz-surface-alt)";
   notice.style.borderRadius = "4px";
   notice.style.fontSize = "0.85em";
   notice.style.fontWeight = "bold";
-  notice.style.color = "#4a4a4a";
+  notice.style.color = "var(--wizz-text-soft)";
   notice.textContent = text;
   (container || document.querySelector(".route-list")).prepend(notice);
 }
@@ -634,7 +682,7 @@ function ensureBatchBar() {
   track.style.position = "relative";
   track.style.flex = "1";
   track.style.height = "30px";
-  track.style.backgroundColor = "#f0f0f0";
+  track.style.backgroundColor = "var(--wizz-surface-alt)";
   track.style.borderRadius = "4px";
   track.style.overflow = "hidden";
 
@@ -642,7 +690,7 @@ function ensureBatchBar() {
   fill.id = "batch-bar-fill";
   fill.style.height = "100%";
   fill.style.width = "0%";
-  fill.style.backgroundColor = "#4ecdc4";
+  fill.style.backgroundColor = "var(--wizz-aqua)";
   fill.style.transition = "width 0.2s ease";
   track.appendChild(fill);
 
@@ -654,7 +702,7 @@ function ensureBatchBar() {
   text.style.transform = "translate(-50%, -50%)";
   text.style.fontSize = "0.85em";
   text.style.whiteSpace = "nowrap";
-  text.style.color = "#1c1c1c";
+  text.style.color = "var(--wizz-text-strong)";
   text.style.fontWeight = "bold";
   track.appendChild(text);
   bar.appendChild(track);
@@ -712,7 +760,7 @@ function makeBatchSummaryColumn(id, label, color) {
   const labelText = document.createElement("div");
   labelText.textContent = label;
   labelText.style.fontSize = "0.8em";
-  labelText.style.color = "#4a4a4a";
+  labelText.style.color = "var(--wizz-text-soft)";
   column.appendChild(labelText);
 
   return column;
@@ -731,13 +779,13 @@ function ensureBatchSummary() {
   row.style.maxWidth = "600px";
   row.style.margin = "10px auto";
   row.style.padding = "10px";
-  row.style.border = "1px solid #ddd";
+  row.style.border = "1px solid var(--wizz-border)";
   row.style.borderRadius = "5px";
-  row.style.backgroundColor = "#fafafa";
+  row.style.backgroundColor = "var(--wizz-surface-alt)";
 
-  row.appendChild(makeBatchSummaryColumn("found", "Available", "#48c774"));
-  row.appendChild(makeBatchSummaryColumn("closed", "Closed", "#7a7a7a"));
-  row.appendChild(makeBatchSummaryColumn("errored", "Errored", "#ef5e74"));
+  row.appendChild(makeBatchSummaryColumn("found", "Available", "var(--wizz-ok)"));
+  row.appendChild(makeBatchSummaryColumn("closed", "Closed", "var(--wizz-muted)"));
+  row.appendChild(makeBatchSummaryColumn("errored", "Errored", "var(--wizz-danger)"));
 
   const routeList = document.querySelector(".route-list");
   if (routeList && routeList.parentNode) {
@@ -755,8 +803,8 @@ function renderBatchSummary() {
     element.textContent = String(batchCounts[key]);
     if (key === "errored") {
       const alarmed = batchCounts[key] > 0;
-      element.style.backgroundColor = alarmed ? "#ef5e74" : "transparent";
-      element.style.color = alarmed ? "#ffffff" : "#ef5e74";
+      element.style.backgroundColor = alarmed ? "var(--wizz-danger)" : "transparent";
+      element.style.color = alarmed ? "#ffffff" : "var(--wizz-danger)";
     }
   }
 }
@@ -827,7 +875,7 @@ function createStatusCard(routeKey, routeLabel) {
   card.className = "route-status-card";
   card.style.padding = "10px";
   card.style.marginBottom = "6px";
-  card.style.border = "1px solid #ddd";
+  card.style.border = "1px solid var(--wizz-border)";
   card.style.borderRadius = "5px";
   card.style.fontSize = "0.8em";
 
@@ -848,7 +896,7 @@ function createStatusCard(routeKey, routeLabel) {
   const detailDiv = document.createElement("div");
   detailDiv.className = "route-status-detail";
   detailDiv.style.display = "none";
-  detailDiv.style.color = "#7a7a7a";
+  detailDiv.style.color = "var(--wizz-muted)";
   detailDiv.style.marginTop = "4px";
   card.appendChild(detailDiv);
 
@@ -877,12 +925,12 @@ function updateSessionChip(state) {
   const text = document.getElementById("session-text");
   if (!dot || !text) return;
   const states = {
-    unknown: ["Session unknown", "#b5b5b5"],
-    checking: ["Checking session...", "#485fc7"],
-    valid: ["Session valid", "#48c774"],
-    expired: ["Session expired", "#ef5e74"],
-    ratelimited: ["Rate limited", "#f5a623"],
-    error: ["Check failed", "#f5a623"],
+    unknown: ["Session unknown", "var(--wizz-muted-light)"],
+    checking: ["Checking session...", "var(--wizz-accent)"],
+    valid: ["Session valid", "var(--wizz-ok)"],
+    expired: ["Session expired", "var(--wizz-danger)"],
+    ratelimited: ["Rate limited", "var(--wizz-warn)"],
+    error: ["Check failed", "var(--wizz-warn)"],
   };
   const [label, color] = states[state] || states.unknown;
   text.textContent = label;
@@ -965,7 +1013,7 @@ function updateTokenCountdown() {
   if (remaining <= 0) {
     if (currentSessionState === "valid") {
       text.textContent = "Session token expired — re-login advised";
-      dot.style.backgroundColor = "#ef5e74";
+      dot.style.backgroundColor = "var(--wizz-danger)";
     }
     return;
   }
@@ -975,7 +1023,7 @@ function updateTokenCountdown() {
   if (currentSessionState === "expired") return;
 
   const minutesLeft = remaining / 60000;
-  const color = minutesLeft < 2 ? "#f5a623" : "#48c774";
+  const color = minutesLeft < 2 ? "var(--wizz-warn)" : "var(--wizz-ok)";
   text.textContent = `Session valid (${formatRemaining(remaining)})`;
   dot.style.backgroundColor = color;
 }
@@ -1138,10 +1186,11 @@ function showSearchHistory() {
   resultsDiv.style.margin = "0 auto";
 
   // History mode: Start is out of context here; a same-sized Clear All takes
-  // its full-width slot. No in-list header — the tab already names the view.
+  // its full-width slot. Soft red (matching the per-row Delete buttons) —
+  // the hard red stays reserved for Stop and the error labels.
   const startButton = document.getElementById("search-flights");
   if (startButton) startButton.style.display = "none";
-  if (history.length !== 0 && startButton && startButton.parentNode) {
+  if (history.length !== 0) {
     document.getElementById("history-clear-all")?.remove();
     const clearAllButton = document.createElement("button");
     clearAllButton.id = "history-clear-all";
@@ -1149,17 +1198,22 @@ function showSearchHistory() {
     clearAllButton.classList.add(
       "button",
       "is-danger",
-      "is-fullwidth",
-      "mt-3"
+      "is-light",
+      "is-fullwidth"
     );
+    clearAllButton.style.marginBottom = "12px";
     clearAllButton.addEventListener("click", clearSearchHistory);
-    startButton.parentNode.insertBefore(clearAllButton, startButton);
+    if (startButton && startButton.parentNode) {
+      startButton.parentNode.insertBefore(clearAllButton, startButton);
+    } else {
+      resultsDiv.prepend(clearAllButton);
+    }
   }
 
   if (history.length === 0) {
     const emptyMessage = document.createElement("p");
     emptyMessage.textContent = "No previous searches yet.";
-    emptyMessage.style.color = "#0f0f0f";
+    emptyMessage.style.color = "var(--wizz-text-strong)";
     resultsDiv.appendChild(emptyMessage);
     return;
   }
@@ -1176,9 +1230,38 @@ function showSearchHistory() {
     const typeLabel = entry.searchType === "arrive" ? "arriving" : "departing";
     viewButton.style.flex = "1";
     viewButton.style.textAlign = "left";
-    viewButton.textContent = `${entry.origin} (${typeLabel}) on ${entry.date} - ${entry.results.length} flights`;
+    viewButton.style.justifyContent = "flex-start";
+    const chevron = document.createElement("span");
+    chevron.className = "history-chevron";
+    viewButton.appendChild(chevron);
+    viewButton.appendChild(
+      document.createTextNode(
+        `${entry.origin} (${typeLabel}) on ${entry.date} - ${entry.results.length} flights`
+      )
+    );
+
+    // Accordion: the results panel sits right below the heading; first
+    // click renders it (and re-renders into itself on later visits), and
+    // clicking the heading again hides it
+    const detail = document.createElement("div");
+    detail.className = "history-entry-detail";
     viewButton.addEventListener("click", () => {
-      displayResults({ [entry.date]: entry.results }, false, entry.outcomes || []);
+      const opening = detail.style.display !== "block";
+      chevron.classList.toggle("open", opening);
+      if (!opening) {
+        detail.style.display = "none";
+        return;
+      }
+      if (!detail.dataset.rendered) {
+        displayResults(
+          { [entry.date]: entry.results },
+          false,
+          entry.outcomes || [],
+          detail
+        );
+        detail.dataset.rendered = "true";
+      }
+      detail.style.display = "block";
     });
     row.appendChild(viewButton);
 
@@ -1193,6 +1276,7 @@ function showSearchHistory() {
     row.appendChild(deleteButton);
 
     resultsDiv.appendChild(row);
+    resultsDiv.appendChild(detail);
   });
 }
 
@@ -1249,7 +1333,9 @@ function nativeHttpSessionProbe() {
 
 async function checkRoute(origin, destination, date) {
   try {
-    const delay = Math.floor(Math.random() * (1000 - 500 + 1)) + 1000;
+    // Regular pacing: 1-4 s of jitter per request; the ONLY backoff besides
+    // this is reactive (Wizz's Retry-After on 429 — see makeRateLimitError)
+    const delay = Math.floor(Math.random() * 3000) + 1000;
     await new Promise((resolve) => setTimeout(resolve, delay));
 
     const dynamicUrl = await getDynamicUrl();
@@ -1520,20 +1606,6 @@ async function checkAllRoutes() {
       }
       if (isRateLimited) break;
 
-      if (completedRoutes > 0 && completedRoutes % 25 === 0) {
-        await abortableSleep(15000, (remaining) => {
-          const seconds = Math.ceil(remaining / 1000);
-          updateBatchBar(
-            `Pausing ${seconds}s to avoid rate limiting (${completedRoutes}/${destinations.length})`,
-            completedRoutes / destinations.length
-          );
-        });
-        if (batchAborted) {
-          console.log("Batch stopped by user during cooldown");
-          break;
-        }
-      }
-
       const apiOrigin = searchType === "arrive" ? destination : origin;
       const apiDestination = searchType === "arrive" ? origin : destination;
       const routeLabel = `${apiOrigin} to ${apiDestination}`;
@@ -1677,7 +1749,6 @@ async function checkAllRoutes() {
         `${completedRoutes}/${destinations.length}`,
         completedRoutes / destinations.length
       );
-      await abortableSleep(200);
     }
 
     removeBatchBar();
@@ -1717,8 +1788,16 @@ async function checkAllRoutes() {
   }
 }
 
-function displayResults(flightsByDate, append = false, outcomes = null) {
-  const routeListElement = document.querySelector(".route-list");
+function displayResults(
+  flightsByDate,
+  append = false,
+  outcomes = null,
+  targetElement = null
+) {
+  // targetElement: render into a detached container (history accordion
+  // panels); default is the live .route-list
+  const routeListElement =
+    targetElement || document.querySelector(".route-list");
   if (!routeListElement) {
     console.error("Error: .route-list element not found in the DOM");
     return;
@@ -1766,12 +1845,12 @@ function displayResults(flightsByDate, append = false, outcomes = null) {
       dateHeader = document.createElement("h3");
       dateHeader.setAttribute("data-date", date);
       dateHeader.classList.add("route-date-header");
-      dateHeader.style.backgroundColor = "#f0f0f0";
+      dateHeader.style.backgroundColor = "var(--wizz-surface-alt)";
       dateHeader.style.padding = "8px 10px";
       dateHeader.style.borderRadius = "5px";
       dateHeader.style.fontSize = "0.9em";
       dateHeader.style.fontWeight = "bold";
-      dateHeader.style.color = "#4a4a4a";
+      dateHeader.style.color = "var(--wizz-text-soft)";
       dateHeader.textContent = new Date(date).toLocaleDateString("en-US", {
         weekday: "long",
         day: "numeric",
@@ -1798,7 +1877,7 @@ function displayResults(flightsByDate, append = false, outcomes = null) {
       const flightItem = document.createElement("li");
       flightItem.style.marginBottom = "15px";
       flightItem.style.padding = "10px";
-      flightItem.style.border = "1px solid #ddd";
+      flightItem.style.border = "1px solid var(--wizz-border)";
       flightItem.style.borderRadius = "5px";
       flightItem.style.display = "flex";
       flightItem.style.flexDirection = "column";
@@ -1826,7 +1905,7 @@ function displayResults(flightsByDate, append = false, outcomes = null) {
       const durationDiv = document.createElement("div");
       durationDiv.textContent = `⏱️ Duration: ${flight.duration}`;
       durationDiv.style.fontSize = "0.85em";
-      durationDiv.style.color = "#7a7a7a";
+      durationDiv.style.color = "var(--wizz-muted)";
 
       detailsDiv.appendChild(departureDiv);
       detailsDiv.appendChild(arrivalDiv);
@@ -1955,7 +2034,7 @@ document.addEventListener("DOMContentLoaded", () => {
   sessionDot.style.width = "10px";
   sessionDot.style.height = "10px";
   sessionDot.style.borderRadius = "50%";
-  sessionDot.style.backgroundColor = "#b5b5b5";
+  sessionDot.style.backgroundColor = "var(--wizz-muted-light)";
   sessionDot.style.flexShrink = "0";
   sessionDot.style.display = "inline-block";
 
@@ -1979,6 +2058,49 @@ document.addEventListener("DOMContentLoaded", () => {
   const actionWrap = document.createElement("div");
   actionWrap.style.display = "flex";
   actionWrap.style.gap = "8px";
+
+  // Theme cycle button: single icon button (like the session chip) that
+  // walks light -> dark -> auto; the icon shows the active mode
+  const themeButton = document.createElement("button");
+  themeButton.id = "theme-toggle";
+  themeButton.classList.add("button", "is-small", "is-light");
+  themeButton.setAttribute("aria-label", "Cycle theme");
+  themeButton.title = "Cycle theme";
+  const themeIcon =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" ' +
+    'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">';
+  const themeIcons = {
+    light:
+      '<span class="icon is-small">' +
+      themeIcon +
+      '<circle cx="12" cy="12" r="5"/>' +
+      '<line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>' +
+      '<line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>' +
+      '<line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>' +
+      '<line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>' +
+      "</svg></span>",
+    dark:
+      '<span class="icon is-small">' +
+      themeIcon +
+      '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>' +
+      "</svg></span>",
+    auto: '<span class="icon is-small">' + themeIcon +
+      '<rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>' +
+      '<line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>' +
+      "</svg></span>",
+  };
+  const renderThemeButton = () => {
+    themeButton.innerHTML = themeIcons[getThemeMode()];
+  };
+  themeButton.addEventListener("click", () => {
+    const order = ["light", "dark", "auto"];
+    const next = order[(order.indexOf(getThemeMode()) + 1) % order.length];
+    setThemeMode(next);
+    renderThemeButton();
+  });
+  renderThemeButton();
+  actionWrap.appendChild(themeButton);
 
   // Open/switch to the Wizz Air Multipass page: keeps the session's source
   // page around (staying active there keeps the token warm). In the app it

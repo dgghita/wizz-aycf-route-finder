@@ -2,10 +2,113 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <script>
+    // Resolve the theme before first paint so dark phones don't flash light.
+    // Same keys as popup.js: localStorage["wizz-theme"] = light|dark|auto.
+    (function () {
+      try {
+        var mode = localStorage.getItem("wizz-theme") || "auto";
+        var dark =
+          mode === "dark" ||
+          (mode === "auto" &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.setAttribute(
+          "data-theme",
+          dark ? "dark" : "light"
+        );
+      } catch (e) {}
+    })();
+  </script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Wizz Air Route Preview</title>
   <link rel="stylesheet" href="css/bulma.min.css">
   <style>
+    /* Color scheme: one variable set, one dark override. Bulma 1.x picks up
+       html[data-theme="dark"] natively; our custom CSS reads the vars. */
+    :root {
+      --wizz-surface: #ffffff;
+      --wizz-surface-alt: #f0f0f0;
+      --wizz-panel: var(--wizz-panel, #f5f5f5);
+      --wizz-hover: #ffffff;
+      --wizz-border: var(--wizz-border, #e0e0e0);
+      --wizz-border-soft: var(--wizz-border-soft, #ececec);
+      --wizz-border-strong: var(--wizz-border-strong, #d5d5d5);
+      --wizz-text: #363636;
+      --wizz-text-strong: #1c1c1c;
+      --wizz-text-soft: #4a4a4a;
+      --wizz-muted: #7a7a7a;
+      --wizz-muted-light: #b5b5b5;
+      --wizz-slider: var(--wizz-slider, #dbdbdb);
+      --wizz-accent: var(--wizz-accent, #485fc7);
+      --wizz-ok: #48c774;
+      --wizz-danger: #ef5e74;
+      --wizz-warn: #f5a623;
+      --wizz-aqua: #4ecdc4;
+    }
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      /* Bulma 1.0.2 dark theme: the exact variable set bulma's own
+         sass/themes/dark.scss registers; the *-l values drive every derived
+         component variable (buttons, inputs, tags) because they are all
+         var() references, so only these need to change. */
+      --bulma-scheme-brightness: dark;
+      --bulma-scheme-main-l: 9%;
+      --bulma-scheme-main-bis-l: 11%;
+      --bulma-scheme-main-ter-l: 13%;
+      --bulma-background-l: 14%;
+      --bulma-border-weak-l: 21%;
+      --bulma-border-l: 24%;
+      --bulma-text-weak-l: 53%;
+      --bulma-text-l: 71%;
+      --bulma-text-strong-l: 93%;
+      --bulma-text-title-l: 100%;
+      --bulma-soft-l: 20%;
+      --bulma-bold-l: 90%;
+      --bulma-soft-invert-l: 90%;
+      --bulma-bold-invert-l: 20%;
+      /* is-light helpers (inactive tabs, chips, history rows, delete
+         buttons) all hang off --bulma-light; bulma 1.0.2 ships no dark
+         values for those, so raise them here: dark tinted surfaces with
+         light text */
+      --bulma-light-l: 13%;
+      --bulma-light-invert-l: 93%;
+      --bulma-info-light-invert-l: 70%;
+      --bulma-danger-light-invert-l: 70%;
+      --bulma-hover-background-l-delta: 5%;
+      --bulma-active-background-l-delta: 10%;
+      --bulma-hover-border-l-delta: 10%;
+      --bulma-active-border-l-delta: 20%;
+      --bulma-hover-color-l-delta: 5%;
+      --bulma-active-color-l-delta: 10%;
+      --bulma-white-on-scheme-l: 100%;
+      --bulma-black-on-scheme-l: 0%;
+      --bulma-light-on-scheme-l: 96%;
+      --bulma-dark-on-scheme-l: 56%;
+      --bulma-text-on-scheme-l: 54%;
+      --bulma-primary-on-scheme-l: 41%;
+      --bulma-link-on-scheme-l: 73%;
+      --bulma-info-on-scheme-l: 70%;
+      --bulma-success-on-scheme-l: 53%;
+      --bulma-warning-on-scheme-l: 53%;
+      --bulma-danger-on-scheme-l: 70%;
+      --bulma-shadow-h: 0;
+      --bulma-shadow-s: 0%;
+      --bulma-shadow-l: 100%;
+      /* Our custom chrome */
+      --wizz-surface: #1e1e1e;
+      --wizz-surface-alt: #2b2b2b;
+      --wizz-panel: #2b2b2b;
+      --wizz-hover: #3a3c3c;
+      --wizz-border: #3a3c3c;
+      --wizz-border-soft: #444444;
+      --wizz-border-strong: #565658;
+      --wizz-text: #e8e8e8;
+      --wizz-text-strong: #f5f5f7;
+      --wizz-text-soft: #cfcfcf;
+      --wizz-muted: #a0a0a0;
+      --wizz-muted-light: var(--wizz-muted, #7a7a7a);
+      --wizz-slider: #565658;
+    }
     html,
     body {
       height: 100%;
@@ -28,9 +131,9 @@
       flex: 0 0 auto;
       padding: 6px 14px 8px;
       font-size: 0.72rem;
-      color: #8a8a8a;
-      border-top: 1px solid #ececec;
-      background: #ffffff;
+      color: var(--wizz-muted, #7a7a7a);
+      border-top: 1px solid var(--wizz-border-soft, #ececec);
+      background: var(--wizz-surface, #ffffff);
       line-height: 1.4;
     }
     footer.app-footer p {
@@ -55,8 +158,8 @@
       right: 0;
       width: 100%;
       z-index: 100;
-      background: #ffffff;
-      border-bottom: 1px solid #e0e0e0;
+      background: var(--wizz-surface, #ffffff);
+      border-bottom: 1px solid var(--wizz-border, #e0e0e0);
       padding: 10px 14px;
       margin: 0 0 8px;
       box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
@@ -131,7 +234,7 @@
       height: 0;
       border-left: 5px solid transparent;
       border-right: 5px solid transparent;
-      border-top: 6px solid #8a8a8a;
+      border-top: 6px solid var(--wizz-muted, #7a7a7a);
       transition: transform 0.15s ease;
     }
     .airport-chevron.open::before {
@@ -144,8 +247,8 @@
       height: 172px;
       box-sizing: border-box;
       overflow-y: auto;
-      background: #f5f5f5;
-      border: 1px solid #d5d5d5;
+      background: var(--wizz-panel, #f5f5f5);
+      border: 1px solid var(--wizz-border-strong, #d5d5d5);
       border-top: none;
       border-radius: 0 0 4px 4px;
       margin-top: -1px;
@@ -158,14 +261,14 @@
       padding: 7px 8px;
       font-size: 0.85rem;
       cursor: pointer;
-      border-bottom: 1px solid #e4e4e4;
+      border-bottom: 1px solid var(--wizz-border-soft, #ececec);
     }
     .airport-dropdown .airport-option:last-child {
       border-bottom: none;
     }
     .airport-dropdown .airport-option .code {
       flex-shrink: 0;
-      color: #777777;
+      color: var(--wizz-muted, #7a7a7a);
     }
     .airport-dropdown .airport-option .name {
       text-align: left;
@@ -176,7 +279,7 @@
     }
     .airport-dropdown .airport-option.active,
     .airport-dropdown .airport-option:hover {
-      background: #ffffff;
+      background: var(--wizz-hover, #ffffff);
     }
     /* Phone-style toggle switch: label left, switch right */
     .detailed-log-row {
@@ -188,7 +291,7 @@
     }
     .detailed-log-row .switch-label {
       font-size: 0.9rem;
-      color: #363636;
+      color: var(--wizz-text, #363636);
     }
     .detailed-log-row .wizz-switch {
       position: relative;
@@ -209,7 +312,7 @@
       left: 0;
       right: 0;
       bottom: 0;
-      background-color: #dbdbdb;
+      background-color: var(--wizz-slider, #dbdbdb);
       border-radius: 26px;
       transition: background-color 0.2s ease;
     }
@@ -226,7 +329,7 @@
       box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
     }
     .detailed-log-row .wizz-switch input:checked + .slider {
-      background-color: #485fc7;
+      background-color: var(--wizz-accent, #485fc7);
     }
     .detailed-log-row .wizz-switch input:checked + .slider::before {
       transform: translateX(20px);
@@ -238,6 +341,29 @@
     }
     .route-cards:not(.show-details) .route-status-card {
       display: none;
+    }
+    /* Search history entries: accordion headings; the results render in a
+       bordered panel between the rows, toggled in place (no drill-down) */
+    .history-entry-detail {
+      display: none;
+      padding: 8px 10px;
+      margin: 0 0 8px;
+      border: 1px solid var(--wizz-border, #e0e0e0);
+      border-radius: 5px;
+      background: var(--wizz-surface, #ffffff);
+    }
+    .history-chevron {
+      display: inline-block;
+      width: 0;
+      height: 0;
+      border-left: 5px solid transparent;
+      border-right: 5px solid transparent;
+      border-top: 6px solid var(--wizz-muted, #7a7a7a);
+      margin-right: 8px;
+      transition: transform 0.15s ease;
+    }
+    .history-chevron.open {
+      transform: rotate(180deg);
     }
   </style>
 </head>

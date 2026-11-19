@@ -2,7 +2,10 @@ package com.dgghita.wizzroutefinder
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.Context
 import android.content.res.Configuration
+import android.graphics.drawable.ColorDrawable
+import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.util.Base64
@@ -78,15 +81,64 @@ class MainActivity : Activity() {
     @Volatile private var tokenExpiryEpochSeconds: Long? = null
     @Volatile private var tokenCapturedAtEpochSeconds: Long? = null
 
+    /**
+     * Theme (light|dark|auto), shared with the page's localStorage toggle.
+     * dark/light force the uiMode so the Wizz webviews dark too (algorithmic
+     * darkening + prefers-color-scheme); auto leaves the system value.
+     */
+    private fun appThemeMode(): String =
+        getSharedPreferences(THEME_PREFS, MODE_PRIVATE)
+            .getString("mode", "auto") ?: "auto"
+
+    private fun isDarkThemeActive(): Boolean =
+        when (appThemeMode()) {
+            "dark" -> true
+            "light" -> false
+            // auto: resolve against the (possibly system-driven) current uiMode
+            else ->
+                (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                    Configuration.UI_MODE_NIGHT_YES
+        }
+
+    override fun attachBaseContext(base: Context) {
+        val mode =
+            base.getSharedPreferences(THEME_PREFS, MODE_PRIVATE)
+                .getString("mode", "auto") ?: "auto"
+        val nightBits =
+            when (mode) {
+                "dark" -> Configuration.UI_MODE_NIGHT_YES
+                "light" -> Configuration.UI_MODE_NIGHT_NO
+                else -> null
+            }
+        super.attachBaseContext(
+            if (nightBits == null) {
+                base
+            } else {
+                val config = Configuration(base.resources.configuration)
+                config.uiMode =
+                    nightBits or
+                        (config.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv())
+                base.createConfigurationContext(config)
+            }
+        )
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Kill the white flash while the webviews load: background follows
+        // the theme the same way the page's pre-paint script does
+        val bg = if (isDarkThemeActive()) 0xFF1E1E1E.toInt() else 0xFFFFFFFF.toInt()
+        window.setBackgroundDrawable(ColorDrawable(bg))
 
         root = FrameLayout(this)
         setContentView(root)
 
         mainWebView = createMainWebView()
         wizzWebView = createWizzWebView()
+        mainWebView.setBackgroundColor(bg)
+        wizzWebView.setBackgroundColor(bg)
 
         root.addView(mainWebView, FrameLayout.LayoutParams(-1, -1))
         root.addView(wizzWebView, FrameLayout.LayoutParams(-1, -1))
@@ -177,6 +229,12 @@ class MainActivity : Activity() {
         return WebView(this).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
+            // Wizz pages are not adaptive; algorithmic darkening force-darkens
+            // them when the theme (or the forced uiMode) is night. The main
+            // webview must NOT get this: the popup CSS has its own dark theme.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                settings.isAlgorithmicDarkeningAllowed = true
+            }
             webChromeClient = createConsoleForwardingClient("wizz")
             webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(
@@ -356,6 +414,23 @@ class MainActivity : Activity() {
             showWizzLogin(true)
         }
 
+        /**
+         * Page-side theme switch (light|dark|auto), from the popup's
+         * sun/moon/computer toggle. Persist, then recreate so
+         * attachBaseContext re-wraps resources with the new uiMode (the
+         * webviews: fresh main popup reads data-theme from storage itself).
+         */
+        @JavascriptInterface
+        fun setAppTheme(mode: String) {
+            val cleaned = if (mode == "light" || mode == "dark") mode else "auto"
+            getSharedPreferences(THEME_PREFS, MODE_PRIVATE)
+                .edit()
+                .putString("mode", cleaned)
+                .apply()
+            Log.d(TAG, "app theme set to $cleaned (recreating)")
+            runOnUiThread { recreate() }
+        }
+
         @JavascriptInterface
         fun hasWizzData(): Boolean = routesJson != null && dynamicUrl != null
 
@@ -523,6 +598,7 @@ class MainActivity : Activity() {
         private const val BODY_LOG_SNIPPET = 200
         private const val RATE_LIMIT_BODY_LOG = 1000
         private const val CREDS_PREFS = "wizz-credentials"
+        private const val THEME_PREFS = "wizz-theme"
 
         /** Decode the `exp` claim from a JWT-shaped Authorization value. */
         private fun parseJwtExpiry(value: String): Long? {

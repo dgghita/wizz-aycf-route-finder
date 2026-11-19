@@ -434,6 +434,13 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun hasWizzData(): Boolean = routesJson != null && dynamicUrl != null
 
+        /** Presence of each captured piece, for the status chip's verdicts. */
+        @JavascriptInterface
+        fun hasRoutes(): Boolean = routesJson != null
+
+        @JavascriptInterface
+        fun hasDynamicUrl(): Boolean = dynamicUrl != null
+
         @JavascriptInterface
         fun getRoutesJson(): String = routesJson ?: ""
 

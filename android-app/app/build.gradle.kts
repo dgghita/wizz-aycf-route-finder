@@ -11,7 +11,7 @@ android {
         applicationId = "com.dgghita.wizzroutefinder"
         minSdk = 24
         targetSdk = 34
-        versionCode = 17
+        versionCode = 19
         versionName = "2.0.0"
     }
 

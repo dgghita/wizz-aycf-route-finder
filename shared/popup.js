@@ -45,6 +45,11 @@ themeMedia.addEventListener("change", () => {
   if (getThemeMode() === "auto") applyStoredTheme();
 });
 
+// Apply the stored theme on every load. The inline head script in
+// popup.html does this pre-paint in the WebView, but extension pages
+// block inline scripts via MV3 CSP, so the popup relies on this call.
+applyStoredTheme();
+
 function waitForWizzData(timeoutMs = 300000) {
   return new Promise((resolve, reject) => {
     const getData = () => {
@@ -135,38 +140,50 @@ function refreshAirportSuggestions() {
 }
 
 /**
- * Extension only, fire-and-forget: ask any multipass tab to scrape the routes
- * data off the page into the popup cache. The routes gate polls this cache;
- * this just feeds it while the user has a multipass page open.
+ * Extension only: ask any multipass tab to scrape the routes data off the
+ * page into the popup cache. The routes gate and the session sync both await
+ * it (it is the routes half of a sync); other callers use it fire-and-forget.
+ * Resolves true when fresh routes landed in the cache.
  */
 function scrapeRoutesFromMultipassTab() {
-  if (typeof chrome === "undefined" || !chrome.tabs || !chrome.tabs.query) {
-    return;
-  }
-  chrome.tabs.query({}, function (tabs) {
-    const tab = (tabs || []).find(
-      (t) => t.url && t.url.includes("multipass.wizzair.com")
-    );
-    if (!tab) return;
-    chrome.tabs.sendMessage(
-      tab.id,
-      { action: "getDestinations", origin: "" },
-      function (response) {
-        if (chrome.runtime.lastError || !response || !response.routes) return;
-        try {
-          const pageData = JSON.parse(
-            localStorage.getItem("wizz_page_data") || "{}"
-          );
-          pageData.routes = response.routes;
-          pageData.timestamp = Date.now();
-          localStorage.setItem("wizz_page_data", JSON.stringify(pageData));
-          console.log("Scraped fresh routes data from the multipass tab");
-          refreshAirportSuggestions();
-        } catch (e) {
-          console.error("Failed to cache scraped routes:", e);
-        }
+  return new Promise((resolve) => {
+    if (typeof chrome === "undefined" || !chrome.tabs || !chrome.tabs.query) {
+      resolve(false);
+      return;
+    }
+    chrome.tabs.query({}, function (tabs) {
+      const tab = (tabs || []).find(
+        (t) => t.url && t.url.includes("multipass.wizzair.com")
+      );
+      if (!tab) {
+        resolve(false);
+        return;
       }
-    );
+      chrome.tabs.sendMessage(
+        tab.id,
+        { action: "getDestinations", origin: "" },
+        function (response) {
+          if (chrome.runtime.lastError || !response || !response.routes) {
+            resolve(false);
+            return;
+          }
+          try {
+            const pageData = JSON.parse(
+              localStorage.getItem("wizz_page_data") || "{}"
+            );
+            pageData.routes = response.routes;
+            pageData.timestamp = Date.now();
+            localStorage.setItem("wizz_page_data", JSON.stringify(pageData));
+            console.log("Scraped fresh routes data from the multipass tab");
+            refreshAirportSuggestions();
+            resolve(true);
+          } catch (e) {
+            console.error("Failed to cache scraped routes:", e);
+            resolve(false);
+          }
+        }
+      );
+    });
   });
 }
 
@@ -914,32 +931,79 @@ function setRouteCard(container, routeKey, routeLabel, state, detail) {
   applyStatusToCard(card, state, detail);
 }
 
-// Session check: classify the current Wizz session without a full search
-// Session status: colored dot + status text in the header, left of the
-// refresh button. Kept the historical function name for the call sites.
-let currentSessionState = "unknown";
+// Session status = the health of the app's whole data pipeline, not just
+// auth: token + routes + search URL. Colored dot + status text in the
+// header; the chip itself is the sync button. Kept the historical function
+// name for the call sites (the app also calls it from native).
+// States: unsynced | syncing | missing-login | missing-routes |
+// missing-url | failed | up-to-date
+let currentSessionState = "unsynced";
+
+const SESSION_CHIP_STATES = {
+  unsynced: ["Not synced yet", "var(--wizz-muted-light)"],
+  syncing: ["Syncing data...", "var(--wizz-warn)"],
+  "missing-login": ["Missing login", "var(--wizz-danger)"],
+  "missing-routes": ["Missing routes", "var(--wizz-danger)"],
+  "missing-url": ["Missing search URL", "var(--wizz-danger)"],
+  failed: ["Sync failed", "var(--wizz-warn)"],
+  "up-to-date": ["Up to date", "var(--wizz-ok)"],
+};
 
 function updateSessionChip(state) {
-  currentSessionState = state || "unknown";
+  currentSessionState = state || "unsynced";
   const dot = document.getElementById("session-dot");
   const text = document.getElementById("session-text");
   if (!dot || !text) return;
-  const states = {
-    unknown: ["Session unknown", "var(--wizz-muted-light)"],
-    checking: ["Checking session...", "var(--wizz-accent)"],
-    valid: ["Session valid", "var(--wizz-ok)"],
-    expired: ["Session expired", "var(--wizz-danger)"],
-    ratelimited: ["Rate limited", "var(--wizz-warn)"],
-    error: ["Check failed", "var(--wizz-warn)"],
-  };
-  const [label, color] = states[state] || states.unknown;
+  const [label, color] =
+    SESSION_CHIP_STATES[currentSessionState] || SESSION_CHIP_STATES.unsynced;
   text.textContent = label;
   dot.style.backgroundColor = color;
-  // Flipping to valid should compose the countdown immediately, not wait
-  // up to 15 s for the next tick
-  if (currentSessionState === "valid" && typeof Android !== "undefined") {
+  // Flipping to up-to-date should compose the countdown immediately, not
+  // wait up to 15 s for the next tick
+  if (
+    currentSessionState === "up-to-date" &&
+    typeof Android !== "undefined"
+  ) {
     updateTokenCountdown();
   }
+}
+
+// Presence of the two scraped pieces (independent of auth):
+// - app: the capture webview's last extraction, via dedicated bridge getters
+// - extension: the popup cache, with the same 1-hour freshness the search
+//   path applies; anything older counts as missing (a sync re-scrapes)
+function hasRoutesData() {
+  try {
+    if (typeof Android !== "undefined") return Android.hasRoutes();
+    const data = JSON.parse(localStorage.getItem("wizz_page_data") || "{}");
+    return (
+      !!data.routes &&
+      data.timestamp &&
+      Date.now() - data.timestamp < 60 * 60 * 1000
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
+function hasDynamicUrlData() {
+  try {
+    if (typeof Android !== "undefined") return Android.hasDynamicUrl();
+    const data = JSON.parse(localStorage.getItem("wizz_page_data") || "{}");
+    return (
+      !!data.dynamicUrl &&
+      data.timestamp &&
+      Date.now() - data.timestamp < 60 * 60 * 1000
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
+/** True only when the probe proves the captured auth is accepted. */
+function probeProvesAuth(status, body) {
+  if (String(body || "").includes("error.token.mismatch")) return false;
+  return !(status === 401 || status === 403);
 }
 
 function formatRemaining(ms) {
@@ -1011,51 +1075,46 @@ function updateTokenCountdown() {
 
   const remaining = info.expiresAtEpochSeconds * 1000 - Date.now();
   if (remaining <= 0) {
-    if (currentSessionState === "valid") {
+    if (currentSessionState === "up-to-date") {
       text.textContent = "Session token expired — re-login advised";
       dot.style.backgroundColor = "var(--wizz-danger)";
     }
     return;
   }
   // The countdown reflects the JWT's own exp claim — ground truth of the
-  // token — so it renders in any probe state (unknown, error, ratelimited);
-  // only a definitive "expired" verdict hides it
-  if (currentSessionState === "expired") return;
+  // token — so it renders whenever there is a token and the chip is green;
+  // a definitive non-green state keeps its own message
+  if (currentSessionState !== "up-to-date") return;
 
   const minutesLeft = remaining / 60000;
   const color = minutesLeft < 2 ? "var(--wizz-warn)" : "var(--wizz-ok)";
-  text.textContent = `Session valid (${formatRemaining(remaining)})`;
+  text.textContent = `Up to date (${formatRemaining(remaining)})`;
   dot.style.backgroundColor = color;
 }
 
-function classifySessionStatus(status) {
-  if (status === 401 || status === 403) return "expired";
-  if (status === 429) return "ratelimited";
-  if (status === 0) return "error";
-  return "valid";
-}
-
-// The session status button doubles as the refresh control. In reload mode
-// (extension: content script missing) clicking it reloads the Wizz page first.
+// The session status button doubles as the sync control. In reload mode
+// (extension: content script missing) tapping it reloads the Wizz page first
+// — an explicit user action, never automatic.
 function updateSessionButton(reloadMode) {
   const button = document.getElementById("check-session");
   if (!button) return;
   button.dataset.mode = reloadMode ? "reload" : "check";
   if (reloadMode) {
     const text = document.getElementById("session-text");
-    if (text) text.textContent = "Session check failed — tap to reload";
+    if (text) text.textContent = "Sync failed — tap to reload";
   }
 }
 
-// Reload the multipass tab, then re-run the session check once it settles
+// Reload the multipass tab (explicit user tap on the chip, extension
+// reload-mode only), then re-run the sync once it settles
 function reloadPageAndCheckSession() {
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     const tab = tabs[0];
     if (!tab || !tab.url || !tab.url.includes("multipass.wizzair.com")) {
-      updateSessionChip("error");
+      updateSessionChip("failed");
       return;
     }
-    updateSessionChip("checking");
+    updateSessionChip("syncing");
     chrome.tabs.reload(tab.id, {}, () => {
       chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
         if (tabId !== tab.id || info.status !== "complete") return;
@@ -1067,68 +1126,92 @@ function reloadPageAndCheckSession() {
   });
 }
 
+/**
+ * Sync the app's session data and reflect the result on the chip. The sync
+ * NEVER opens/reloads a page by itself — the Wizz AYCF Page button is the
+ * user's way to do that. What a sync does:
+ * - app: one cheap native probe (proves the captured auth is accepted) and
+ *   freshness reads of the captured routes/search URL
+ * - extension: one probe via any multipass tab + a fresh routes scrape from
+ *   that tab (fire-and-forget callers elsewhere keep working; now awaited
+ *   here so the chip can react to it)
+ * Returns the resulting chip state ("up-to-date" is the only green).
+ */
 async function checkSessionStatus() {
-  updateSessionChip("checking");
+  updateSessionChip("syncing");
+  // auth: true (probe proves it), false (probe denies it), "unknown"
+  let authState = "unknown";
+
   try {
     if (typeof Android !== "undefined") {
       const response = await nativeHttpSessionProbe();
-      const state = classifySessionStatus(response.status);
-      // A 500 carrying error.token.mismatch means the captured JWT no longer
-      // pairs with the cookie session — same practical consequence as expiry,
-      // so don't let the lenient "any non-401 is valid" rule pass it
-      if (String(response.body || "").includes("error.token.mismatch")) {
-        console.log("Session check: token.mismatch in body, treating as expired");
-        updateSessionChip("expired");
-        Android.forceReLogin();
-        return "expired";
-      }
-      console.log(`Session check: status=${response.status} state=${state}`);
-      updateSessionChip(state);
-      if (state === "expired") {
-        Android.forceReLogin();
-      }
-      return state;
-    }
-
-    // Chrome extension: probe from the multipass page via the content script.
-    // Any multipass tab will do (the sidebar can be open on any page), not
-    // just the currently active one.
-    const allTabs = await chrome.tabs.query({});
-    const tab = (allTabs || []).find(
-      (t) => t.url && t.url.includes("multipass.wizzair.com")
-    );
-    if (!tab) {
-      updateSessionChip("error");
-      throw new Error("Open the Wizz Air Multipass page to check the session");
-    }
-    const response = await new Promise((resolve) => {
-      chrome.tabs.sendMessage(tab.id, { action: "checkSession" }, (res) => {
-        if (chrome.runtime.lastError) {
-          resolve(undefined);
-        } else {
-          resolve(res);
-        }
-      });
-    });
-    console.log("checkSession response from content script:", response);
-    if (response && typeof response.status === "number") {
-      const state = classifySessionStatus(response.status);
+      authState = probeProvesAuth(response.status, response.body)
+        ? true
+        : false;
       console.log(
-        `Session check: status=${response.status} state=${state} body=${(response.body || "").slice(0, 300)}`
+        `Session sync: probe status=${response.status} authOk=${authState}`
       );
-      updateSessionChip(state);
-      updateSessionButton(false);
-      return state;
     } else {
-      console.error("Session check: no valid response (content script missing? reload the multipass page)");
-      updateSessionChip("error");
-      updateSessionButton(true);
+      // Chrome extension: probe from the multipass page via the content
+      // script. Any multipass tab will do (the sidebar can be open on any
+      // page), not just the currently active one.
+      const allTabs = await chrome.tabs.query({});
+      const tab = (allTabs || []).find(
+        (t) => t.url && t.url.includes("multipass.wizzair.com")
+      );
+      if (!tab) {
+        // No multipass page = nothing to authenticate against or scrape
+        authState = false;
+      } else {
+        // Sync the routes cache from the live tab while we're probing it
+        await scrapeRoutesFromMultipassTab();
+        const response = await new Promise((resolve) => {
+          chrome.tabs.sendMessage(tab.id, { action: "checkSession" }, (res) => {
+            if (chrome.runtime.lastError) {
+              resolve(undefined);
+            } else {
+              resolve(res);
+            }
+          });
+        });
+        console.log("checkSession response from content script:", response);
+        if (response && typeof response.status === "number") {
+          console.log(
+            `Session sync: status=${response.status} body=${(response.body || "").slice(0, 300)}`
+          );
+          authState = probeProvesAuth(response.status, response.body)
+            ? true
+            : false;
+          updateSessionButton(false);
+        } else {
+          console.error(
+            "Session sync: no valid response (content script missing? reload the multipass page)"
+          );
+          // "Tap to reload" mode: reloading the page is the user's choice,
+          // applied only when they tap the chip
+          updateSessionButton(true);
+        }
+      }
     }
   } catch (error) {
-    console.error("Session check failed:", error);
-    updateSessionChip("error");
+    console.error("Session sync failed:", error);
+    authState = "unknown";
   }
-  return "error";
+
+  // Compose the verdict: specific red per missing piece, green only when
+  // everything needed to operate is present and proven current
+  if (authState === false) {
+    updateSessionChip("missing-login");
+  } else if (!hasRoutesData()) {
+    updateSessionChip("missing-routes");
+  } else if (!hasDynamicUrlData()) {
+    updateSessionChip("missing-url");
+  } else if (authState === true) {
+    updateSessionChip("up-to-date");
+  } else {
+    updateSessionChip("failed");
+  }
+  return currentSessionState;
 }
 
 function loadSearchHistory() {
@@ -1559,19 +1642,19 @@ async function checkAllRoutes() {
       }
     }
 
-    // Probe session/token health first: only a definite "valid" starts a batch
+    // Sync first: only a definite green (token + routes + search URL all
+    // present and proven accepted) starts a batch
     const sessionState = await checkSessionStatus();
-    if (sessionState !== "valid") {
-      console.log(`Check Routes aborted: session state is ${sessionState}`);
-      if (sessionState === "expired") {
-        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Session expired. Please log in to Wizz Air and try again.</p>`;
-      } else if (sessionState === "ratelimited") {
-        document.querySelector("#rate-limited-message").style.display = "block";
+    if (sessionState !== "up-to-date") {
+      console.log(`Check Routes aborted: sync state is ${sessionState}`);
+      if (sessionState === "missing-login") {
+        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Missing login. Open the Wizz page (top right) and log in, then tap the status at the top to sync.</p>`;
+      } else if (sessionState === "missing-routes") {
+        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Missing routes. Open the Wizz page (top right) so the sync can capture them.</p>`;
+      } else if (sessionState === "missing-url") {
+        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Missing search URL. Open the Wizz page (top right) so the sync can capture it.</p>`;
       } else {
         routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Could not verify the session. Tap the session status at the top and try again.</p>`;
-        if (typeof Android !== "undefined") {
-          Android.openWizzLogin();
-        }
       }
       return;
     }
@@ -2040,7 +2123,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const sessionText = document.createElement("span");
   sessionText.id = "session-text";
-  sessionText.textContent = "Session unknown";
+  sessionText.textContent = "Not synced yet";
   sessionText.style.fontSize = "0.85em";
 
   statusButton.appendChild(sessionDot);
@@ -2181,8 +2264,8 @@ document.addEventListener("DOMContentLoaded", () => {
     };
     airportGate();
 
-    // Probe on open too: without it the chip sits at "Session unknown" and
-    // the countdown's (former) state gate hid it until the first Start
+    // Sync on open too: the chip starts gray ("Not synced yet") and this
+    // resolves it to up-to-date or a specific missing state
     checkSessionStatus().catch((e) => console.warn("Auto session check:", e));
   } else {
     // Extension: poll the cache; while nothing is cached, actively scrape

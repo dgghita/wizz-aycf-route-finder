@@ -14,3 +14,6 @@ captures/
 
 # Machine-local SDK config
 local.properties
+
+# Archived APKs
+android-app/releases/

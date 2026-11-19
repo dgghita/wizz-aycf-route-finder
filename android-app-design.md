@@ -50,14 +50,15 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
 2–4 come first so the behaviors in 1/3/5 are debuggable.
 
 #### 0. UI structure (v2 rework)
-- **Session header** at the top. The **status chip itself is the refresh
-  button**: colored status dot + text ("Session valid" / "Session expired" /
-  "Rate limited" / ...) inside a small button; tapping it probes the session
-  again (in the extension it flips into "reload the multipass page and
-  re-probe" mode when the content script is missing). On the right:
-  **"Wizz AYCF Page"** — in the extension it switches to the multipass tab or
-  opens one if none exists; in the app it shows the capture webview (with
-  its Reload/Close toolbar, plus back-button close). The app has **no
+- **Session header** at the top. The **status chip itself is the sync
+  button**: colored status dot + text ("Up to date" / "Missing login" /
+  "Missing routes" / "Missing search URL" / ... inside a small button;
+  tapping it runs another sync — see item 5 (in the extension it flips into
+  "Sync failed — tap to reload" mode when the content script is missing). On
+  the right: **"Wizz AYCF Page"** — in the extension it switches to the
+  multipass tab or opens one if none exists; in the app it shows the capture
+  webview (with its Reload/Close toolbar, plus back-button close). The app
+  has **no
   manual Re-login button** (removed build 14): pages now always re-capture
   routes/dynamic-URL on load, so opening the Wizz page and logging in is
   itself the full re-login; `forceReLogin()` remains as an internal
@@ -173,20 +174,29 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
   Open the popup's DevTools and filter the console by `api` for the same
   view logcat gives on device.
 
-#### 5. Token validation
-- A "Check session" action: fires one cheap request to Wizz and classifies the
-  result as valid / expired / rate-limited.
-- Surface the session state in the UI (e.g., first line of the debug overlay
-  or a small status chip) so the user knows before starting a batch.
-- **Check Routes runs the same probe first** and only a definite `valid`
-  verdict starts a batch. Expired: expired message (app: login screen shows).
-  Rate limited: the rate-limit banner. Anything else ("error", e.g. missing
-  content script or no captured session): the batch is refused with a "could
-  not verify the session" message; in the app the login WebView opens.
-- In the extension, a missing/stale content script flips the button into
-  "Reload page to check session" which reloads the multipass tab and re-probes.
-- **Done when:** the user can tell at a glance whether their session is alive,
-  and a dead session never wastes a batch.
+#### 5. Session status = the health of the whole data pipeline
+- **Rework (supersedes "token validation"):** the chip no longer answers
+  "are the auth headers alive" but "does the app have everything it needs to
+  operate": token + routes + search URL. One green state (`Up to date`,
+  with the live countdown in parens, app only) and specific failure states:
+  gray `Not synced yet` (no sync ever attempted), yellow `Syncing data...`
+  (in flight), red `Missing login` / `Missing routes` / `Missing search
+  URL` (the first missing piece wins: login > routes > search URL), yellow
+  `Sync failed` (probe unreachable). `Up to date` requires the probe to
+  prove the captured auth is accepted; 401/403 and `error.token.mismatch`
+  read as `Missing login`.
+- Tapping the chip runs another sync of whatever is stale (app: native probe
+  + presence checks; extension: probe + a fresh routes scrape from the
+  multipass tab). The sync NEVER opens or reloads a page by itself — the
+  Wizz AYCF Page button is the explicit path. Exception kept: in the
+  extension, a missing/stale content script flips the chip into
+  "Sync failed — tap to reload" (reload happens only on that tap).
+- **Check Routes runs the same sync first** and only `up-to-date` starts a
+  batch; the refusal messages name the missing piece and point at the Wizz
+  page button (no auto-login).
+- **Done when:** the user can tell at a glance which piece of session data
+  is missing, a dead session never wastes a batch, and the chip reaches
+  green on its own after closing the capture webview (sync fires on close).
 
 #### 6. Honor Wizz's back-off instructions
 - 429 responses are treated as instructions, not as fatal: the bridge now
@@ -209,11 +219,11 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
   `{hasToken, expiresAtEpochSeconds, capturedAtEpochSeconds}` to the JS via a
   `getTokenInfo()` bridge.
 - The session header composes a real countdown into the status text:
-  "Session valid (MM:SS)" counting down, refreshed every 15 s. The
-  countdown renders in **any** probe state (build 16: it reflects the
-  JWT's own `exp`, so "unknown"/"rate limited"/"check failed" never hide
-  it — only a definitive "expired" does), and the app probes on popup open
-  too, so the chip is current from the start.
+  "Up to date (MM:SS)" counting down, refreshed every 15 s. The countdown
+  renders while the chip is green (item 5 rework: the states are discrete
+  messages, so the parens countdown belongs to `Up to date`); the chip
+  reaches `up-to-date` right after a successful sync (on popup open and on
+  capture-webview close), so it is current from the start.
   Amber when under 2 minutes remain, red past expiry. When the countdown hits
   zero, the text suggests a re-login.
 - Extension unaffected (no `getTokenInfo` bridge there).

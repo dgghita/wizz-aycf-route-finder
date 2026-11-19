@@ -18,7 +18,17 @@ function getThemeMode() {
 }
 
 function resolveTheme(mode) {
-  return mode === "auto" ? (themeMedia.matches ? "dark" : "light") : mode;
+  if (mode !== "auto") return mode;
+  if (typeof Android !== "undefined" && Android.isAppDarkTheme) {
+    // The WebView's prefers-color-scheme doesn't reliably track the system
+    // theme on Android; ask the app, which reads the live uiMode
+    try {
+      return Android.isAppDarkTheme() ? "dark" : "light";
+    } catch (e) {
+      /* fall through to the media query */
+    }
+  }
+  return themeMedia.matches ? "dark" : "light";
 }
 
 function applyStoredTheme() {

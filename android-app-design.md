@@ -425,6 +425,39 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
   (both in light and dark), the detailed-log toggle shows/hides the
   outcome cards inside an open panel, and Clear All reads as a soft red.
 
+#### 15. Session capture survives recreation; honest auto theme on Android
+- **Intent:** the captured routes/URL lived only in activity fields, so
+  every `recreate()` (theme tap called `setAppTheme` → recreate; system
+  dark-mode flip and process death did the same) lost them and onCreate
+  popped the login webview back open — clicking the theme button
+  "opened the page". Also, "auto" trusted the WebView's
+  `prefers-color-scheme`, which does not reliably track system dark mode.
+  And the recreate churn itself made the app unstable: rapid theme taps
+  leaked WebViews and killed the renderer (twice — first crashes ever,
+  the webview going permanently blank).
+- **Fix, part 1 (data):** routes/URL persist to SharedPreferences
+  (`wizz-data`) on capture, restore in onCreate, and clear on forced
+  re-login.
+- **Fix, part 2 (theme):** `setAppTheme` no longer recreates — it
+  persists and retints the window/webview backgrounds only; the popup
+  applies its own dark theme via CSS, and the Wizz page webview darkens
+  on next launch. `resolveTheme("auto")` in the popup asks the new
+  `Android.isAppDarkTheme()` bridge, which reads the uiMode from the
+  application context (activity resources may be force-wrapped NIGHT_YES
+  by `attachBaseContext` and won't track system changes — the original
+  reason "system" was never detected). `onConfigurationChanged`
+  re-applies the stored theme.
+- **Fix, part 3 (stability):** both WebViews recover from renderer death:
+  `onRenderProcessGone` removes the dead view, destroys it, rebuilds it
+  in place, and reloads (captured data/theme survive in storage).
+- **Known limit:** algorithmic darkening of the Wizz page webview still
+  depends on the dark state in effect at launch/next launch; the popup's
+  own dark theme is unaffected.
+- **Done when:** on the device, cycling the theme button never shows the
+  Wizz webview, never blanks anything, and can be tapped as fast as
+  wanted; with the OS in dark and mode=auto, the app opens dark; killing
+  and reopening the app keeps data and doesn't pop the webview.
+
 #### Explicitly out of scope for v2- Full UI overhaul (user intent: it's coming, after observability proves out).
 - (Token expiry countdown was moved into scope as item 7; a manual re-login
   already exists via error paths.)

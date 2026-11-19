@@ -17,6 +17,7 @@ import android.view.View
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -76,6 +77,15 @@ class MainActivity : Activity() {
     @Volatile private var dynamicUrl: String? = null
     @Volatile private var notifiedDataReady = false
 
+    /** Captured data survives activity recreation (theme switch, fold/unfold). */
+    private fun persistData() {
+        getSharedPreferences(DATA_PREFS, MODE_PRIVATE)
+            .edit()
+            .putString("routesJson", routesJson)
+            .putString("dynamicUrl", dynamicUrl)
+            .apply()
+    }
+
     // Token expiry (from the JWT `exp` claim in the Authorization header), so
     // the UI can show a real countdown
     @Volatile private var tokenExpiryEpochSeconds: Long? = null
@@ -94,9 +104,13 @@ class MainActivity : Activity() {
         when (appThemeMode()) {
             "dark" -> true
             "light" -> false
-            // auto: resolve against the (possibly system-driven) current uiMode
+            // auto: read the system uiMode from the application context — the
+            // activity's resources may have been force-wrapped with
+            // NIGHT_YES by attachBaseContext at launch and won't track the
+            // system switch (this was why "system" was never detected)
             else ->
-                (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                (applicationContext.resources.configuration.uiMode and
+                    Configuration.UI_MODE_NIGHT_MASK) ==
                     Configuration.UI_MODE_NIGHT_YES
         }
 
@@ -173,6 +187,12 @@ class MainActivity : Activity() {
 
         mainWebView.loadUrl("file:///android_asset/popup.html")
 
+        // Restore the last capture so a theme switch (recreate) or process
+        // death doesn't force the user through the login webview again
+        val dataPrefs = getSharedPreferences(DATA_PREFS, MODE_PRIVATE)
+        routesJson = dataPrefs.getString("routesJson", null)
+        dynamicUrl = dataPrefs.getString("dynamicUrl", null)
+
         if (routesJson == null || dynamicUrl == null) {
             showWizzLogin(false)
         }
@@ -196,6 +216,13 @@ class MainActivity : Activity() {
         }
         root.post(kick)
         root.postDelayed(kick, 120)
+
+        // System dark-mode flip while the popup is open: re-resolve the
+        // theme (auto mode asks the bridge, which reads the new uiMode)
+        mainWebView.evaluateJavascript(
+            "typeof applyStoredTheme === 'function' && applyStoredTheme();",
+            null
+        )
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -205,7 +232,33 @@ class MainActivity : Activity() {
             settings.domStorageEnabled = true
             webChromeClient = createConsoleForwardingClient("popup")
             addJavascriptInterface(WizzBridge(), "Android")
+            webViewClient = object : WebViewClient() {
+                override fun onRenderProcessGone(
+                    view: WebView,
+                    detail: RenderProcessGoneDetail?
+                ): Boolean {
+                    rebuildMainWebView()
+                    return true
+                }
+            }
         }
+    }
+
+    /**
+     * Renderer crash recovery: the killed WebView must leave the view tree
+     * (or Android takes the whole app down). Replace it with a fresh one and
+     * reload the popup — captured data and theme prefs survive in storage.
+     */
+    private fun rebuildMainWebView() {
+        val bg = if (isDarkThemeActive()) 0xFF1E1E1E.toInt() else 0xFFFFFFFF.toInt()
+        val dead = mainWebView
+        root.removeView(dead)
+        dead.destroy()
+        mainWebView = createMainWebView()
+        mainWebView.setBackgroundColor(bg)
+        root.addView(mainWebView, 0, FrameLayout.LayoutParams(-1, -1))
+        mainWebView.loadUrl("file:///android_asset/popup.html")
+        Log.d(TAG, "main webview rebuilt after renderer crash")
     }
 
     /** Mirror WebView console output to logcat so `adb logcat` shows JS logs. */
@@ -285,8 +338,34 @@ class MainActivity : Activity() {
                         handler.postDelayed({ injectCredentialHooks(view) }, 4500)
                     }
                 }
+
+                override fun onRenderProcessGone(
+                    view: WebView,
+                    detail: RenderProcessGoneDetail?
+                ): Boolean {
+                    rebuildWizzWebView()
+                    return true
+                }
             }
         }
+    }
+
+    private fun rebuildWizzWebView() {
+        val bg = if (isDarkThemeActive()) 0xFF1E1E1E.toInt() else 0xFFFFFFFF.toInt()
+        val wasVisible = wizzWebView.visibility == View.VISIBLE
+        val dead = wizzWebView
+        root.removeView(dead)
+        dead.destroy()
+        wizzWebView = createWizzWebView()
+        wizzWebView.setBackgroundColor(bg)
+        root.addView(wizzWebView, 1, FrameLayout.LayoutParams(-1, -1))
+        if (wasVisible) {
+            wizzWebView.loadUrl(WALLETS_URL)
+            wizzToolbar.visibility = View.VISIBLE
+        } else {
+            wizzWebView.visibility = View.GONE
+        }
+        Log.d(TAG, "wizz webview rebuilt after renderer crash")
     }
 
     private fun showWizzLogin(clearData: Boolean) {
@@ -295,6 +374,8 @@ class MainActivity : Activity() {
                 routesJson = null
                 dynamicUrl = null
                 notifiedDataReady = false
+                getSharedPreferences(DATA_PREFS, MODE_PRIVATE)
+                    .edit().clear().apply()
             }
             wizzWebView.loadUrl(WALLETS_URL)
             wizzWebView.visibility = View.VISIBLE
@@ -345,6 +426,7 @@ class MainActivity : Activity() {
             }.getOrNull()
             if (!parsed.isNullOrBlank() && parsed != "null") {
                 routesJson = parsed
+                persistData()
                 Log.d(TAG, "routes extracted (${parsed.length} chars)")
                 notifyDataReady()
             } else {
@@ -357,6 +439,7 @@ class MainActivity : Activity() {
             }.getOrNull()
             if (!parsed.isNullOrBlank() && parsed != "null") {
                 dynamicUrl = parsed
+                persistData()
                 Log.d(TAG, "dynamic URL extracted: $parsed")
                 notifyDataReady()
             } else {
@@ -415,10 +498,11 @@ class MainActivity : Activity() {
         }
 
         /**
-         * Page-side theme switch (light|dark|auto), from the popup's
-         * sun/moon/computer toggle. Persist, then recreate so
-         * attachBaseContext re-wraps resources with the new uiMode (the
-         * webviews: fresh main popup reads data-theme from storage itself).
+         * Page-side theme switch (light|dark|auto), from the popup's toggle.
+         * Persist only: the popup applies its own dark theme via CSS, so
+         * recreating here (the previous behaviour) just churned WebViews and
+         * destabilized the app. The Wizz page webview picks the new uiMode up
+         * on next launch.
          */
         @JavascriptInterface
         fun setAppTheme(mode: String) {
@@ -427,12 +511,27 @@ class MainActivity : Activity() {
                 .edit()
                 .putString("mode", cleaned)
                 .apply()
-            Log.d(TAG, "app theme set to $cleaned (recreating)")
-            runOnUiThread { recreate() }
+            Log.d(TAG, "app theme set to $cleaned (no recreation)")
+            runOnUiThread {
+                val bg =
+                    if (isDarkThemeActive()) 0xFF1E1E1E.toInt()
+                    else 0xFFFFFFFF.toInt()
+                window.setBackgroundDrawable(ColorDrawable(bg))
+                mainWebView.setBackgroundColor(bg)
+            }
         }
 
         @JavascriptInterface
         fun hasWizzData(): Boolean = routesJson != null && dynamicUrl != null
+
+        /**
+         * Whether the app currently renders dark (explicit dark, explicit
+         * light, or the system uiMode for auto). The popup asks this instead
+         of trusting the WebView's prefers-color-scheme, which does not
+         reliably track system dark mode.
+         */
+        @JavascriptInterface
+        fun isAppDarkTheme(): Boolean = isDarkThemeActive()
 
         /** Presence of each captured piece, for the status chip's verdicts. */
         @JavascriptInterface
@@ -606,6 +705,7 @@ class MainActivity : Activity() {
         private const val RATE_LIMIT_BODY_LOG = 1000
         private const val CREDS_PREFS = "wizz-credentials"
         private const val THEME_PREFS = "wizz-theme"
+        private const val DATA_PREFS = "wizz-data"
 
         /** Decode the `exp` claim from a JWT-shaped Authorization value. */
         private fun parseJwtExpiry(value: String): Long? {

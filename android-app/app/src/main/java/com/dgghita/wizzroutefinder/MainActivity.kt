@@ -233,6 +233,30 @@ class MainActivity : Activity() {
             webChromeClient = createConsoleForwardingClient("popup")
             addJavascriptInterface(WizzBridge(), "Android")
             webViewClient = object : WebViewClient() {
+                // The popup is a local file; anything else (e.g. the footer's
+                // Changelog link) belongs to the system browser. Handing it
+                // over stops the WebView from navigating away and letting the
+                // back button exit the app.
+                override fun shouldOverrideUrlLoading(
+                    view: WebView,
+                    request: WebResourceRequest
+                ): Boolean {
+                    val url = request.url
+                    // Local popup content stays in the WebView
+                    if (url.scheme in setOf("file", "data", "about", "javascript")) {
+                        return false
+                    }
+                    // http(s) or anything exotic: system browser's job
+                    try {
+                        startActivity(
+                            android.content.Intent(android.content.Intent.ACTION_VIEW, url)
+                        )
+                    } catch (e: Exception) {
+                        Log.w(TAG, "no activity to open $url")
+                    }
+                    return true
+                }
+
                 override fun onRenderProcessGone(
                     view: WebView,
                     detail: RenderProcessGoneDetail?

@@ -299,6 +299,26 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
   its own mid-run (bar announces the reload, the route card stays "in
   flight", then resolves normally) — no extension reload, no tab juggling.
 
+#### 11. Async native HTTP bridge (perceived-freeze fix)
+
+- **Symptom on device:** the UI never painted mid-batch — no "Checking
+  session..." text, cards only appeared in the gaps between requests; it
+  felt like freezes. Cause: the bridge methods returned `String`
+  synchronously, so the WebView's JS thread blocked on the native HTTP call
+  and no rendering happened until it returned.
+- **Fix:** `checkRoute(url, payload, callbackId)` and
+  `checkSession(callbackId)` are now fire-and-forget: the HTTP runs on a
+  small background executor (`Executors.newFixedThreadPool(2)`) and the
+  result is delivered with `evaluateJavascript` into
+  `window.__nativeHttpCallback(callbackId, response)`. The shared script
+  wraps that in `nativeHttpPost()` / `nativeHttpSessionProbe()` promises,
+  with a 45s timeout resolving `{status: 0, body: "native call timed out"}`
+  so a wedged native call can never hang a card. The Kotlin `executePost`
+  logic itself is unchanged.
+- **Done when:** batches on device paint continuously — the bar and
+  "Checking session..." render immediately, cards populate as responses
+  land.
+
 #### Explicitly out of scope for v2- Full UI overhaul (user intent: it's coming, after observability proves out).
 - (Token expiry countdown was moved into scope as item 7; a manual re-login
   already exists via error paths.)

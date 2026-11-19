@@ -1015,7 +1015,7 @@ async function checkSessionStatus() {
   updateSessionChip("checking");
   try {
     if (typeof Android !== "undefined") {
-      const response = JSON.parse(Android.checkSession());
+      const response = await nativeHttpSessionProbe();
       const state = classifySessionStatus(response.status);
       // A 500 carrying error.token.mismatch means the captured JWT no longer
       // pairs with the cookie session — same practical consequence as expiry,
@@ -1188,6 +1188,57 @@ function showSearchHistory() {
   });
 }
 
+/**
+ * App only, async native HTTP. The old sync bridge (Android.checkRoute()
+ * returning a String) blocked the WebView's JS thread on the HTTP call, so
+ * the UI never painted mid-request. Now the native side runs the request on
+ * a background executor and delivers via window.__nativeHttpCallback; here
+ * we just bridge that into a Promise (with a timeout so a wedged delivery
+ * can't hang a batch card forever).
+ */
+let nativeCallbackSeq = 0;
+const nativeHttpWaiters = new Map();
+
+window.__nativeHttpCallback = (id, response) => {
+  const waiter = nativeHttpWaiters.get(id);
+  if (!waiter) return;
+  nativeHttpWaiters.delete(id);
+  clearTimeout(waiter.timer);
+  waiter.resolve(response);
+};
+
+function nativeHttpPost(url, payloadJson) {
+  return new Promise((resolve) => {
+    const id = `cb${++nativeCallbackSeq}`;
+    const waiter = {
+      resolve,
+      timer: setTimeout(() => {
+        if (nativeHttpWaiters.delete(id)) {
+          resolve({ status: 0, body: "native call timed out", headers: {} });
+        }
+      }, 45000),
+    };
+    nativeHttpWaiters.set(id, waiter);
+    Android.checkRoute(url, payloadJson, id);
+  });
+}
+
+function nativeHttpSessionProbe() {
+  return new Promise((resolve) => {
+    const id = `session${++nativeCallbackSeq}`;
+    const waiter = {
+      resolve,
+      timer: setTimeout(() => {
+        if (nativeHttpWaiters.delete(id)) {
+          resolve({ status: 0, body: "native call timed out", headers: {} });
+        }
+      }, 45000),
+    };
+    nativeHttpWaiters.set(id, waiter);
+    Android.checkSession(id);
+  });
+}
+
 async function checkRoute(origin, destination, date) {
   try {
     const delay = Math.floor(Math.random() * (1000 - 500 + 1)) + 1000;
@@ -1236,8 +1287,7 @@ function extractAvailabilityFlights(parsed) {
     if (typeof Android !== "undefined") {
       // Route the API call through the native bridge to avoid CORS issues
       const callStart = Date.now();
-      const responseJson = Android.checkRoute(dynamicUrl, JSON.stringify(data));
-      const response = JSON.parse(responseJson);
+      const response = await nativeHttpPost(dynamicUrl, JSON.stringify(data));
       logApiCall(
         `${origin}->${destination}`,
         response.status,

@@ -2,6 +2,7 @@ package com.dgghita.wizzroutefinder
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.res.Configuration
 import android.os.Bundle
 import android.util.Base64
 import android.util.Log
@@ -24,6 +25,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
 
@@ -32,6 +34,10 @@ class MainActivity : Activity() {
     private lateinit var wizzWebView: WebView
     private lateinit var closeWizzButton: Button
     private val handler = Handler(Looper.getMainLooper())
+
+    // Background HTTP for the async bridge: the WebView's JS thread must
+    // never block on a network call, or nothing paints
+    private val httpExecutor = Executors.newFixedThreadPool(2)
 
     private val authLock = Any()
     private val authHeaders = HashMap<String, String>()
@@ -79,6 +85,26 @@ class MainActivity : Activity() {
         if (routesJson == null || dynamicUrl == null) {
             showWizzLogin(false)
         }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Fold/unfold: with the config change handled here (no Activity
+        // recreation) the WebView's drawing surface can keep the stale size
+        // until something re-layouts. Kick it on this frame and the next,
+        // since the window may not have finished resizing yet.
+        val kick = Runnable {
+            root.forceLayout()
+            root.invalidate()
+            for (view in listOf(mainWebView, wizzWebView)) {
+                if (view.visibility != View.GONE) {
+                    view.forceLayout()
+                    view.invalidate()
+                }
+            }
+        }
+        root.post(kick)
+        root.postDelayed(kick, 120)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -289,24 +315,32 @@ class MainActivity : Activity() {
         }
 
         /**
-         * Native POST to Wizz Air's availability endpoint. Runs on a bridge
-         * worker thread; blocking here is safe (like the extension's fetch,
-         * this bypasses CORS entirely).
+         * Native POST to Wizz Air's availability endpoint — async. The old
+         * synchronous variant blocked the WebView's JS thread on the HTTP
+         * call, which froze the whole UI (no paints) for every request.
+         * Runs on a background executor and delivers the JSON response via
+         * window.__nativeHttpCallback(callbackId, response).
          */
         @JavascriptInterface
-        fun checkRoute(url: String, payloadJson: String): String {
-            return executePost(url, payloadJson, fullBodyLog = false)
+        fun checkRoute(url: String, payloadJson: String, callbackId: String) {
+            postAsync(url, payloadJson, callbackId, fullBodyLog = false)
         }
 
         /**
-         * Cheap session probe: a minimal availability POST. Wizz answers
+         * Cheap async session probe: a minimal availability POST. Wizz answers
          * 401/403 when the session is dead regardless of payload, so any
          * other status means the auth headers are still accepted.
          */
         @JavascriptInterface
-        fun checkSession(): String {
+        fun checkSession(callbackId: String) {
             val url = dynamicUrl
-                ?: return JSONObject().put("status", 0).put("body", "no dynamic URL").toString()
+            if (url == null) {
+                deliverToJs(
+                    callbackId,
+                    JSONObject().put("status", 0).put("body", "no dynamic URL").toString()
+                )
+                return
+            }
             val probePayload = JSONObject().apply {
                 put("flightType", "OW")
                 put("origin", "AAA")
@@ -315,7 +349,23 @@ class MainActivity : Activity() {
                 put("arrival", "")
                 put("intervalSubtype", JSONObject.NULL)
             }
-            return executePost(url, probePayload.toString(), fullBodyLog = true)
+            postAsync(url, probePayload.toString(), callbackId, fullBodyLog = true)
+        }
+
+        private fun postAsync(url: String, payloadJson: String, callbackId: String, fullBodyLog: Boolean) {
+            httpExecutor.execute {
+                deliverToJs(callbackId, executePost(url, payloadJson, fullBodyLog))
+            }
+        }
+
+        private fun deliverToJs(callbackId: String, json: String) {
+            runOnUiThread {
+                mainWebView.evaluateJavascript(
+                    "window.__nativeHttpCallback && window.__nativeHttpCallback(" +
+                        JSONObject.quote(callbackId) + ", " + json + ");",
+                    null
+                )
+            }
         }
 
         private fun executePost(url: String, payloadJson: String, fullBodyLog: Boolean): String {

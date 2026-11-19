@@ -56,16 +56,29 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
   again (in the extension it flips into "reload the multipass page and
   re-probe" mode when the content script is missing). On the right:
   **"Wizz AYCF Page"** — in the extension it switches to the multipass tab or
-  opens one if none exists; in the app it shows the capture webview (which
-  always has its X, plus back-button close). The app additionally gets
-  **"Re-login"**, which discards captured data and reloads the webview for a
-  fresh login, auto-closing when the new token is captured.
+  opens one if none exists; in the app it shows the capture webview (with
+  its Reload/Close toolbar, plus back-button close). The app has **no
+  manual Re-login button** (removed build 14): pages now always re-capture
+  routes/dynamic-URL on load, so opening the Wizz page and logging in is
+  itself the full re-login; `forceReLogin()` remains as an internal
+  mechanism the batch triggers on expiry/token-mismatch/stale-URL.
+  **Closing the webview also auto-runs the session check** (build 15), so
+  the chip is current the moment you're back — Close button and back
+  gesture both.
   In the **extension both run automatically on popup open**: the session
   probe (any multipass tab, not just the active one) and a fresh routes
   scrape into the cache, which also re-renders the airport suggestions. The
   app does not auto-probe (the countdown + probe-on-Start cover it).
-- The Wizz webview is fullscreen, so it gets a **fixed X Close button** at the
-  top (back button also still closes it).
+- The Wizz webview is fullscreen, so it gets a **fixed toolbar** at the top
+  (Reload on the left, Close on the right; back gesture also still closes).
+- **Login credentials remembered** (build 12): the webview has no browser
+  behind it, so the app keeps its own store — a hook injected on page load
+  saves email/password from the login form on submit (click-capture, only
+  when both fields are non-empty) into app-private `SharedPreferences`, and
+  pre-fills the form on later loads (React-style native setter + input
+  events, blank-fields only, re-tried at 1.5 s / 3 s / 4.5 s for the
+  late-rendered SPA form). Plaintext in private storage — accepted
+  trade-off for a personal, single-device app.
 - **Tab buttons** (two buttons stuck together, one active/pressed) for both
   the main view: "Find Routes | Search History", and the mode: "Depart from |
   Arrive to". No more radios.
@@ -189,7 +202,11 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
   `{hasToken, expiresAtEpochSeconds, capturedAtEpochSeconds}` to the JS via a
   `getTokenInfo()` bridge.
 - The session header composes a real countdown into the status text:
-  "Session valid (MM:SS)" counting down, refreshed every 15 s.
+  "Session valid (MM:SS)" counting down, refreshed every 15 s. The
+  countdown renders in **any** probe state (build 16: it reflects the
+  JWT's own `exp`, so "unknown"/"rate limited"/"check failed" never hide
+  it — only a definitive "expired" does), and the app probes on popup open
+  too, so the chip is current from the start.
   Amber when under 2 minutes remain, red past expiry. When the countdown hits
   zero, the text suggests a re-login.
 - Extension unaffected (no `getTokenInfo` bridge there).
@@ -197,8 +214,9 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
   minute from expiry, Start reloads the capture webview before probing —
   the multipass cookie is assumed to outlive the JWT, so re-auth is silent
   and the batch proceeds (polls up to 60s for a fresh capture). If the
-  refresh produces nothing, the batch is refused with a "use Re-login"
-  message. Manual Re-login stays as the fallback.
+  refresh produces nothing, the batch is refused with an "open the Wizz page
+  and log in again" message (there is no manual Re-login button since
+  build 14).
 - **Done when:** after a re-login the header shows the countdown ticking down
   and flips amber near expiry, and a batch started against an expired token
   recovers on its own (webview blip, fresh capture, batch runs).
@@ -318,6 +336,19 @@ Nothing below is implemented yet. Order is roughly build-then-polish; items
 - **Done when:** batches on device paint continuously — the bar and
   "Checking session..." render immediately, cards populate as responses
   land.
+
+#### 12. Screen-off batches (wakelock)
+- **Problem:** with the screen off, Doze throttles network and freezes JS
+  timers, so batches stall (maybe the same root cause as the perceived
+  freezing; the async bridge fixed rendering, not this).
+- **Fix (build 13):** the page calls `Android.batchKeepAlive(true)` when a
+  batch starts and `batchKeepAlive(false)` in its `finally` — the app holds
+  a `PARTIAL_WAKE_LOCK` (tagged `wizzfinder:batch`, WAKE_LOCK permission)
+  for the duration, capped at 30 min so a wedged batch can't drain the
+  battery. Extension-side code is untouched (`typeof Android` guards).
+- **Done when:** a batch started with the screen off still progresses
+  (cards populate; check afterwards). On aggressive OEMs (Honor) battery
+  settings may still need the app whitelisted from optimization.
 
 #### Explicitly out of scope for v2- Full UI overhaul (user intent: it's coming, after observability proves out).
 - (Token expiry countdown was moved into scope as item 7; a manual re-login

@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.res.Configuration
 import android.os.Bundle
+import android.os.PowerManager
 import android.util.Base64
 import android.util.Log
 import android.os.Handler
@@ -20,6 +21,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.Toast
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -32,12 +34,37 @@ class MainActivity : Activity() {
     private lateinit var root: FrameLayout
     private lateinit var mainWebView: WebView
     private lateinit var wizzWebView: WebView
+    private lateinit var wizzToolbar: LinearLayout
     private lateinit var closeWizzButton: Button
+    private lateinit var reloadWizzButton: Button
     private val handler = Handler(Looper.getMainLooper())
 
     // Background HTTP for the async bridge: the WebView's JS thread must
     // never block on a network call, or nothing paints
     private val httpExecutor = Executors.newFixedThreadPool(2)
+
+    // Held while a batch runs so a screen-off/unplugged device keeps
+    // servicing requests (Doze throttles network and freezes JS timers)
+    private var batchWakeLock: PowerManager.WakeLock? = null
+
+    private fun setBatchWakeLock(active: Boolean) {
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        if (active) {
+            if (batchWakeLock?.isHeld == true) return
+            batchWakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "wizzfinder:batch"
+            ).apply {
+                // Safety cap: a wedged batch must not drain the battery
+                acquire(30 * 60 * 1000L)
+            }
+            Log.d(TAG, "batch wake lock acquired")
+        } else {
+            batchWakeLock?.takeIf { it.isHeld }?.release()
+            batchWakeLock = null
+            Log.d(TAG, "batch wake lock released")
+        }
+    }
 
     private val authLock = Any()
     private val authHeaders = HashMap<String, String>()
@@ -65,20 +92,32 @@ class MainActivity : Activity() {
         root.addView(wizzWebView, FrameLayout.LayoutParams(-1, -1))
         wizzWebView.visibility = View.GONE
 
-        // Fixed X at the top of the (fullscreen) Wizz webview so the user is
-        // never stuck there
-        closeWizzButton = Button(this).apply {
-            text = "X Close"
+        // Toolbar on top of the (fullscreen) Wizz webview: Reload and Close,
+        // so the user is never stuck there and can refresh a stale page
+        wizzToolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
             visibility = View.GONE
+            setPadding(24, 32, 24, 8)
+        }
+        reloadWizzButton = Button(this).apply {
+            text = "Reload"
+            setOnClickListener { wizzWebView.reload() }
+        }
+        wizzToolbar.addView(reloadWizzButton)
+        closeWizzButton = Button(this).apply {
+            text = "Close"
             setOnClickListener { hideWizzWebview() }
         }
-        val closeParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP or Gravity.END
+        wizzToolbar.addView(closeWizzButton)
+        root.addView(
+            wizzToolbar,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP
+            )
         )
-        closeParams.setMargins(24, 96, 24, 0)
-        root.addView(closeWizzButton, closeParams)
 
         mainWebView.loadUrl("file:///android_asset/popup.html")
 
@@ -182,6 +221,10 @@ class MainActivity : Activity() {
                         // The page is a SPA; give it a moment to populate window.CVO
                         handler.postDelayed({ tryExtract() }, 1500)
                         handler.postDelayed({ tryExtract() }, 6000)
+                        // Remember/pre-fill the login form (no browser behind
+                        // the webview, so we keep the credentials ourselves)
+                        handler.postDelayed({ injectCredentialHooks(view) }, 1500)
+                        handler.postDelayed({ injectCredentialHooks(view) }, 4500)
                     }
                 }
             }
@@ -197,7 +240,7 @@ class MainActivity : Activity() {
             }
             wizzWebView.loadUrl(WALLETS_URL)
             wizzWebView.visibility = View.VISIBLE
-            closeWizzButton.visibility = View.VISIBLE
+            wizzToolbar.visibility = View.VISIBLE
             mainWebView.visibility = View.GONE
         }
     }
@@ -205,38 +248,61 @@ class MainActivity : Activity() {
     private fun hideWizzWebview() {
         handler.post {
             wizzWebView.visibility = View.GONE
-            closeWizzButton.visibility = View.GONE
+            wizzToolbar.visibility = View.GONE
             mainWebView.visibility = View.VISIBLE
+            // Returning from the Wizz page: refresh the session chip right
+            // away (close = back too, so both paths get it)
+            mainWebView.evaluateJavascript(
+                "typeof checkSessionStatus === 'function' && " +
+                    "checkSessionStatus().catch(function() {});",
+                null
+            )
         }
     }
 
+    /**
+     * Inject the credential remember/pre-fill script into the Wizz page.
+     * Listeners install once per document; pre-fill runs on every injection
+     * so a late-rendered SPA login form still gets filled.
+     */
+    private fun injectCredentialHooks(view: WebView) {
+        val prefs = getSharedPreferences(CREDS_PREFS, MODE_PRIVATE)
+        val user = prefs.getString("username", "") ?: ""
+        val pass = prefs.getString("password", "") ?: ""
+        val js = CRED_HOOK_JS
+            .replace("__SAVED_USER__", JSONObject.quote(user))
+            .replace("__SAVED_PASS__", JSONObject.quote(pass))
+        view.evaluateJavascript(js, null)
+        Log.d(TAG, "credential hooks injected")
+    }
+
     private fun tryExtract() {
-        if (routesJson == null) {
-            wizzWebView.evaluateJavascript(EXTRACT_ROUTES_JS) { result ->
-                val parsed = runCatching {
-                    JSONTokener(result).nextValue() as? String
-                }.getOrNull()
-                if (!parsed.isNullOrBlank() && parsed != "null") {
-                    routesJson = parsed
-                    Log.d(TAG, "routes extracted (${parsed.length} chars)")
-                    notifyDataReady()
-                } else {
-                    Log.d(TAG, "routes extraction returned nothing yet")
-                }
+        // Always re-extract and overwrite: routes update often, and every
+        // fresh page load (login, manual Reload, Wizz Page button) should
+        // refresh the capture — not just the very first one. This is what
+        // made the old Re-login button redundant.
+        wizzWebView.evaluateJavascript(EXTRACT_ROUTES_JS) { result ->
+            val parsed = runCatching {
+                JSONTokener(result).nextValue() as? String
+            }.getOrNull()
+            if (!parsed.isNullOrBlank() && parsed != "null") {
+                routesJson = parsed
+                Log.d(TAG, "routes extracted (${parsed.length} chars)")
+                notifyDataReady()
+            } else {
+                Log.d(TAG, "routes extraction returned nothing yet")
             }
         }
-        if (dynamicUrl == null) {
-            wizzWebView.evaluateJavascript(EXTRACT_URL_JS) { result ->
-                val parsed = runCatching {
-                    JSONTokener(result).nextValue() as? String
-                }.getOrNull()
-                if (!parsed.isNullOrBlank() && parsed != "null") {
-                    dynamicUrl = parsed
-                    Log.d(TAG, "dynamic URL extracted: $parsed")
-                    notifyDataReady()
-                } else {
-                    Log.d(TAG, "dynamic URL extraction returned nothing yet")
-                }
+        wizzWebView.evaluateJavascript(EXTRACT_URL_JS) { result ->
+            val parsed = runCatching {
+                JSONTokener(result).nextValue() as? String
+            }.getOrNull()
+            if (!parsed.isNullOrBlank() && parsed != "null") {
+                dynamicUrl = parsed
+                Log.d(TAG, "dynamic URL extracted: $parsed")
+                notifyDataReady()
+            } else {
+                Log.d(TAG, "dynamic URL extraction returned nothing yet")
             }
         }
     }
@@ -298,6 +364,32 @@ class MainActivity : Activity() {
 
         @JavascriptInterface
         fun getDynamicUrl(): String = dynamicUrl ?: ""
+
+        /**
+         * Called by the page when a batch starts (active=true) and ends
+         * (active=false): holds a partial wakelock so screen-off batches
+         * keep running through Doze.
+         */
+        @JavascriptInterface
+        fun batchKeepAlive(active: Boolean) {
+            setBatchWakeLock(active)
+        }
+
+        /**
+         * Called by the page's credential hook when the user submits the
+         * login form: remember the credentials for future pre-fill. Stored
+         * plaintext in app-private storage (personal app, local device).
+         */
+        @JavascriptInterface
+        fun saveWizzCredentials(username: String, password: String) {
+            if (username.isEmpty() || password.isEmpty()) return
+            getSharedPreferences(CREDS_PREFS, MODE_PRIVATE)
+                .edit()
+                .putString("username", username)
+                .putString("password", password)
+                .apply()
+            Log.d(TAG, "wizz credentials saved (username length ${username.length})")
+        }
 
         /** JWT expiry info for the session countdown, or hasToken=false. */
         @JavascriptInterface
@@ -430,6 +522,7 @@ class MainActivity : Activity() {
         private const val TAG = "WizzFinder"
         private const val BODY_LOG_SNIPPET = 200
         private const val RATE_LIMIT_BODY_LOG = 1000
+        private const val CREDS_PREFS = "wizz-credentials"
 
         /** Decode the `exp` claim from a JWT-shaped Authorization value. */
         private fun parseJwtExpiry(value: String): Long? {
@@ -497,6 +590,61 @@ class MainActivity : Activity() {
                     }
                 } catch (e) {}
                 return null;
+            })()
+        """.trimIndent()
+
+        /**
+         * Credential remember/pre-fill for the Wizz login form. The app
+         * replaces __SAVED_USER__ / __SAVED_PASS__ with JSON-quoted values
+         * (or "" when nothing is saved yet). The React-style native setter +
+         * input events make SPA-bound fields actually accept the values.
+         */
+        private val CRED_HOOK_JS = """
+            (function() {
+                function findEmail() {
+                    return document.querySelector('input[type="email"], input[name*="email" i], input[id*="email" i]');
+                }
+                function findPassword() {
+                    return document.querySelector('input[type="password"]');
+                }
+                function setValue(input, value) {
+                    if (!input || !value) return;
+                    var setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(input, value);
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                function capture() {
+                    try {
+                        var email = findEmail(); var pass = findPassword();
+                        if (email && pass && email.value && pass.value) {
+                            window.Android.saveWizzCredentials(email.value, pass.value);
+                        }
+                    } catch (e) {}
+                }
+                if (!window.__wizzCredHook) {
+                    window.__wizzCredHook = true;
+                    document.addEventListener('click', function(ev) {
+                        var el = ev.target.closest &&
+                            ev.target.closest('button, input[type="submit"], [role="button"]');
+                        if (el) capture();
+                    }, true);
+                    document.addEventListener('submit', capture, true);
+                }
+                var savedUser = __SAVED_USER__;
+                var savedPass = __SAVED_PASS__;
+                if (savedUser && savedPass) {
+                    function prefill() {
+                        var email = findEmail(); var pass = findPassword();
+                        if (email && pass && !email.value && !pass.value) {
+                            setValue(email, savedUser);
+                            setValue(pass, savedPass);
+                        }
+                    }
+                    prefill();
+                    setTimeout(prefill, 3000);
+                }
             })()
         """.trimIndent()
     }

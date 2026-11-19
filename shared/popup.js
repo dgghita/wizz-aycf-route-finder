@@ -887,6 +887,11 @@ function updateSessionChip(state) {
   const [label, color] = states[state] || states.unknown;
   text.textContent = label;
   dot.style.backgroundColor = color;
+  // Flipping to valid should compose the countdown immediately, not wait
+  // up to 15 s for the next tick
+  if (currentSessionState === "valid" && typeof Android !== "undefined") {
+    updateTokenCountdown();
+  }
 }
 
 function formatRemaining(ms) {
@@ -964,7 +969,10 @@ function updateTokenCountdown() {
     }
     return;
   }
-  if (currentSessionState !== "valid" && currentSessionState !== "checking") return;
+  // The countdown reflects the JWT's own exp claim — ground truth of the
+  // token — so it renders in any probe state (unknown, error, ratelimited);
+  // only a definitive "expired" verdict hides it
+  if (currentSessionState === "expired") return;
 
   const minutesLeft = remaining / 60000;
   const color = minutesLeft < 2 ? "#f5a623" : "#48c774";
@@ -1440,6 +1448,7 @@ async function checkAllRoutes() {
 
   batchRunning = true;
   batchAborted = false;
+  if (typeof Android !== "undefined") Android.batchKeepAlive(true);
   setMainButtonRunning(true);
   ensureBatchBar();
   updateBatchBar("Checking session...", 0);
@@ -1459,7 +1468,7 @@ async function checkAllRoutes() {
       updateBatchBar("Checking session token...", 0);
       const refreshed = await ensureFreshToken();
       if (!refreshed) {
-        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Token expired and could not be refreshed automatically. Use Re-login and try again.</p>`;
+        routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Token expired and could not be refreshed automatically. Open the Wizz page (top right) and log in again.</p>`;
         return;
       }
     }
@@ -1581,7 +1590,7 @@ async function checkAllRoutes() {
           if (String(error.message || "").includes("error.token.mismatch")) {
             console.error("Token mismatch — stopping batch");
             if (typeof Android !== "undefined") Android.forceReLogin();
-            routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Wizz rejected the captured token (token.mismatch). Use Re-login and try again.</p>`;
+            routeListElement.innerHTML = `<p class="is-size-4 has-text-centered">Wizz rejected the captured token (token.mismatch). Open the Wizz page (top right) and log in again.</p>`;
             return;
           }
 
@@ -1702,6 +1711,7 @@ async function checkAllRoutes() {
   } finally {
     batchRunning = false;
     batchAborted = false;
+    if (typeof Android !== "undefined") Android.batchKeepAlive(false);
     setMainButtonRunning(false);
     removeBatchBar();
   }
@@ -1999,19 +2009,9 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   actionWrap.appendChild(pageButton);
 
-  if (typeof Android !== "undefined") {
-    // App-only: discard the captured data and reload the webview for a
-    // completely fresh login; auto-closes when the fresh token is captured
-    const reloginButton = document.createElement("button");
-    reloginButton.id = "open-wizz-session";
-    reloginButton.textContent = "Re-login";
-    reloginButton.classList.add("button", "is-small", "is-danger", "is-light");
-    reloginButton.addEventListener("click", () => {
-      console.log("Re-login requested: opening Wizz session webview");
-      Android.forceReLogin();
-    });
-    actionWrap.appendChild(reloginButton);
-  }
+  // No manual Re-login button: the page always re-captures routes/URL on
+  // load (app side), and the programmatic forceReLogin() covers expiry and
+  // stale-session recovery automatically.
 
   sessionHeader.appendChild(actionWrap);
 
@@ -2058,6 +2058,10 @@ document.addEventListener("DOMContentLoaded", () => {
       refreshAirportSuggestions();
     };
     airportGate();
+
+    // Probe on open too: without it the chip sits at "Session unknown" and
+    // the countdown's (former) state gate hid it until the first Start
+    checkSessionStatus().catch((e) => console.warn("Auto session check:", e));
   } else {
     // Extension: poll the cache; while nothing is cached, actively scrape
     // the multipass tab. Give up after 10s — enable typing and let Check
